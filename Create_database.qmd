@@ -1,0 +1,463 @@
+---
+title: "RUL Challenge Create Database"
+format: html
+---
+
+Load libraries into renv.
+
+```{r}
+
+# renv::install("tidyverse")
+# renv::install("DBI")
+# renv::install("duckdb")
+# renv::install("sparklyr")
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(sparklyr)
+
+```
+
+
+Load data into DuckDB database.
+
+```{r}
+# # 1. Define the folder names (your "G" folders)
+# g_folders <- paste0("G_", 1:5)
+
+# # 2. Define the CSV file names
+# # Use a pattern that matches "channel_1.csv" through "channel_11.csv"
+# csv_files <- paste0("channel_", 1:11, ".csv")
+
+# 3. Connect to the DuckDB database (or create it if it doesn't exist)
+con <- dbConnect(
+  duckdb::duckdb(),
+  "C:\\Users\\shish\\Documents\\rul_challenge_data\\DuckDB\\large_data_warehouse.duckdb"
+)
+
+# # ⭐️ DUCKDB PERFORMANCE TUNING (Add these lines here) ⭐️
+# # Adjust '14GB' to a value slightly less than your total system RAM
+# DBI::dbExecute(con, "SET memory_limit='14GB'")
+# # Adjust '4' to a smaller number of cores than your system has
+# DBI::dbExecute(con, "SET threads=1")
+# # Note: You can also SET preserve_insertion_order=false if needed, but the two above are usually enough.
+# # DBI::dbExecute(con, "SET preserve_insertion_order=false")
+
+# start_time <- Sys.time()
+
+# # 4. Loop through the folders to create schemas and load tables
+# for (g_folder in g_folders) {
+#   # A. Use the folder name as the schema name
+#   schema_name <- g_folder
+
+#   # B. Create the schema (this acts as your folder)
+#   DBI::dbExecute(con, paste("CREATE SCHEMA IF NOT EXISTS", schema_name))
+#   cat("Created schema:", schema_name, "\n")
+
+#   # C. Loop through the CSVs within the current folder
+#   for (csv_file in csv_files) {
+#     # Construct the full file path for the CSV
+
+#     base_path <- "C:\\Users\\shish\\Documents\\rul_challenge_data\\train"
+
+#     full_path <- paste0(base_path, "/", g_folder, "/", csv_file)
+
+#     # Check if the specific file exists before trying to load it
+#     if (file.exists(full_path)) {
+#       # The table name will be the CSV file name (e.g., 'channel_1')
+#       table_name <- sub(".csv$", "", csv_file)
+
+#       # Construct the full SQL table name: schema.table (e.g., G_1.channel_1)
+#       full_table_name <- paste0(schema_name, ".", table_name)
+
+#       # 1. Construct the SQL command
+#       # CREATE OR REPLACE TABLE G_1.channel_1 AS SELECT * FROM READ_CSV_AUTO('full/path/to/file.csv')
+#       sql_command <- paste0(
+#         "CREATE TABLE IF NOT EXISTS ",
+#         full_table_name,
+#         " AS SELECT * FROM READ_CSV_AUTO('",
+#         full_path,
+#         "', HEADER=TRUE)"
+#       )
+
+#       # 2. Execute the SQL command
+#       DBI::dbExecute(con, sql_command)
+
+#       cat("  - Loaded table:", full_table_name, "\n")
+#     }
+#   }
+# }
+
+# end_time <- Sys.time()
+
+# cat(
+#   "Data loading completed in",
+#   round(difftime(end_time, start_time, units = "mins"), 2),
+#   "minutes.\n"
+# )
+```
+
+I have loaded 2 tables into the database. Let me see if I can connect to the database and read some rows and columns.
+
+```{r}
+
+# G1
+
+g1_channel1_lazy <- tbl(con, "G_1.channel_1")
+
+g1_channel1_first_10_rows <- g1_channel1_lazy %>%
+  head(10) %>%
+  collect()
+
+# Get first 10 rows and first 10 columns
+
+g1_channel1_first_10_rows_first_10_cols <- g1_channel1_lazy %>%
+  select(1:10) %>%
+  head(10) %>%
+  collect()
+
+# Find number of rows and columns
+
+g1_channel_1_num_rows <- g1_channel1_lazy %>%
+  summarise(n = n()) %>%
+  collect() %>%
+  pull(n)
+
+g1_channel_1_num_cols <- g1_channel1_lazy %>%
+  colnames() %>%
+  length()
+
+g1_channel1_last_columns <- g1_channel1_lazy %>%
+  select((num_cols - 9):num_cols) %>%
+  head(10) %>%
+  collect()
+
+g1_channel2_lazy <- tbl(con, "G_1.channel_2")
+
+g1_channel2_first_10_rows_2 <- g1_channel2_lazy %>%
+  head(10) %>%
+  collect()
+
+# G2
+
+g2_channel1_lazy <- tbl(con, "G_2.channel_1")
+
+g2_channel1_num_rows <- g2_channel1_lazy %>%
+  summarise(n = n()) %>%
+  collect() %>%
+  pull(n)
+
+# G3
+
+g3_channel1_lazy <- tbl(con, "G_3.channel_1")
+
+g3_channel1_num_rows <- g3_channel1_lazy %>%
+  summarise(n = n()) %>%
+  collect() %>%
+  pull(n)
+
+# G4
+
+g4_channel1_lazy <- tbl(con, "G_4.channel_1")
+
+g4_channel1_num_rows <- g4_channel1_lazy %>%
+  summarise(n = n()) %>%
+  collect() %>%
+  pull(n)
+
+# G5
+
+g5_channel1_lazy <- tbl(con, "G_5.channel_1")
+
+g5_channel1_num_rows <- g5_channel1_lazy %>%
+  summarise(n = n()) %>%
+  collect() %>%
+  pull(n)
+
+# G6
+
+g6_test_1_channel1_lazy <- tbl(con, "G_6_test_1.channel_1")
+
+g6_test_1_channel1_first_10_rows_first_10_cols <- g6_test_1_channel1_lazy %>%
+  select(1:10) %>%
+  head(10) %>%
+  collect()
+
+g6_test_2_channel1_lazy <- tbl(con, "G_6_test_2.channel_1")
+g6_test_2_channel1_first_10_rows_first_10_cols <- g6_test_2_channel1_lazy %>%
+  select(1:10) %>%
+  head(10) %>%
+  collect()
+
+g6_test_3_channel7_lazy <- tbl(con, "G_6_test_3.channel_7")
+g6_test_3_channel7_first_10_rows_first_10_cols <- g6_test_3_channel7_lazy %>%
+  select(1:10) %>%
+  head(10) %>%
+  collect()
+
+
+dbDisconnect(con, shutdown = TRUE)
+
+```
+
+I could connect to the 2 tables using DuckDB. Note that I can only collect() 10 rows at a time since the number of columns is too large (32768). If I try 100 rows, R crashes.
+
+Next, I also want to upload the test data to the DuckDB datbase.
+
+```{r}
+# # 1. Define the folder names (your "G" folders) and the test windows
+# g_folders <- paste0("G_", 6)
+# test_folders <- paste0("test_", 1:5)
+
+# # 2. Define the CSV file names
+# # Use a pattern that matches "channel_1.csv" through "channel_11.csv"
+# csv_files <- paste0("channel_", 1:11, ".csv")
+
+# # 3. Connect to the DuckDB database (or create it if it doesn't exist)
+# con <- dbConnect(
+#   duckdb::duckdb(),
+#   "C:\\Users\\shish\\Documents\\rul_challenge_data\\DuckDB\\large_data_warehouse.duckdb"
+# )
+
+# # ⭐️ DUCKDB PERFORMANCE TUNING (Add these lines here) ⭐️
+# # Adjust '14GB' to a value slightly less than your total system RAM
+# DBI::dbExecute(con, "SET memory_limit='14GB'")
+# # Adjust '4' to a smaller number of cores than your system has
+# DBI::dbExecute(con, "SET threads=1")
+# # Note: You can also SET preserve_insertion_order=false if needed, but the two above are usually enough.
+# # DBI::dbExecute(con, "SET preserve_insertion_order=false")
+
+# start_time <- Sys.time()
+
+# # 4. Loop through the folders to create schemas and load tables
+# for (g_folder in g_folders) {
+#   for (test_folder in test_folders) {
+#     # A. Use the folder name as the schema name
+#     schema_name <- paste0(g_folder, "_", test_folder)
+
+#     # B. Create the schema (this acts as your folder)
+#     DBI::dbExecute(con, paste("CREATE SCHEMA IF NOT EXISTS", schema_name))
+#     cat("Created schema:", schema_name, "\n")
+
+#     # C. Loop through the CSVs within the current folder
+#     for (csv_file in csv_files) {
+#       # Construct the full file path for the CSV
+
+#       base_path <- "C:\\Users\\shish\\Documents\\rul_challenge_data\\test"
+
+#       full_path <- paste0(
+#         base_path,
+#         "/",
+#         g_folder,
+#         "/",
+#         test_folder,
+#         "/",
+#         csv_file
+#       )
+
+#       # Check if the specific file exists before trying to load it
+#       if (file.exists(full_path)) {
+#         # The table name will be the CSV file name (e.g., 'channel_1')
+#         table_name <- sub(".csv$", "", csv_file)
+
+#         # Construct the full SQL table name: schema.table (e.g., G_6_test_1.channel_1)
+#         full_table_name <- paste0(schema_name, ".", table_name)
+
+#         # 1. Construct the SQL command
+#         sql_command <- paste0(
+#           "CREATE TABLE IF NOT EXISTS ",
+#           full_table_name,
+#           " AS SELECT * FROM READ_CSV_AUTO('",
+#           full_path,
+#           "', HEADER=TRUE)"
+#         )
+
+#         # 2. Execute the SQL command
+#         DBI::dbExecute(con, sql_command)
+
+#         cat("  - Loaded table:", full_table_name, "\n")
+#       }
+#     }
+#   }
+# }
+
+# end_time <- Sys.time()
+
+# cat(
+#   "Test data loading completed in",
+#   round(difftime(end_time, start_time, units = "mins"), 2),
+#   "minutes.\n"
+# )
+```
+
+Test folders loaded. Check if I can connect to one of the test tables.
+
+```{r}
+g6_test1_channel1_lazy <- tbl(con, "G_6_test_1.channel_1")
+
+first_10_rows_test <- g6_test1_channel1_lazy %>%
+  head(10) %>%
+  collect()
+
+g6_test5_channel11_lazy <- tbl(con, "G_6_test_5.channel_11")
+
+first_10_rows_test <- g6_test5_channel11_lazy %>%
+  head(10) %>%
+  collect()
+```
+
+
+But the evaluation is too slow. It took 14 minutes to load 2 tables. I need to load almost 60 tables.
+
+Convert CSV to Parquet format for faster loading.
+
+```{r}
+con <- dbConnect(duckdb::duckdb())
+dbExecute(
+  con,
+  "COPY 'G:\\My Drive\\rao@ualberta.ca 2022-12-08 10 58\\shishir@tamu.edu\\My Drive\\Interesting papers\\Survival Models\\Reliability\\RUL Challenge\\rul_challenge_data\\rul_challenge_data\\train\\G_1\\channel_1.csv' TO 'G:\\My Drive\\rao@ualberta.ca 2022-12-08 10 58\\shishir@tamu.edu\\My Drive\\Interesting papers\\Survival Models\\Reliability\\RUL Challenge\\rul_challenge_data\\parquet\\G_1_channel_1.parquet' (FORMAT PARQUET);"
+)
+dbDisconnect(con)
+```
+
+Next, I will try sparklyr to load the data.
+
+```{r}
+# Run this once to install a local version of Spark that sparklyr can use
+# sparklyr::spark_install()
+```
+
+Connecting and loading data with sparklyr.
+
+```{r}
+# 1. Connect to a local Spark instance (using all available cores)
+# The 'sc' object is your Spark connection handle.
+sc <- sparklyr::spark_connect(master = "local[*]")
+
+# 2. Define your file structure parameters
+g_folders <- paste0("G_", 1:1) # Assuming you go back to all 5 folders
+csv_files <- paste0("channel_", 1:1, ".csv")
+
+# 3. Define the base path for your data
+base_path <- "G:/My Drive/rao@ualberta.ca 2022-12-08 10 58/shishir@tamu.edu/My Drive/Interesting papers/Survival Models/Reliability/RUL Challenge/rul_challenge_data/rul_challenge_data/train"
+
+# 4. Loop through the folders to load and register tables
+for (g_folder in g_folders) {
+  # The table name in Spark will be: schema_table (e.g., G_1_channel_1)
+  schema_prefix <- paste0(g_folder, "_")
+
+  # C. Loop through the CSVs within the current folder
+  for (csv_file in csv_files) {
+    # Construct the full file path for the CSV
+    full_path <- file.path(base_path, g_folder, csv_file)
+
+    # The full path Spark needs uses the 'file:///' prefix for local access
+    spark_file_path <- paste0("file:///", full_path)
+
+    # Check if the specific file exists before trying to load it
+    # Note: Spark's reader is very robust, but checking in R first is good practice
+    if (file.exists(full_path)) {
+      table_suffix <- sub(".csv$", "", csv_file)
+      full_table_name <- paste0(schema_prefix, table_suffix)
+
+      cat("Loading and registering table:", full_table_name, "\n")
+
+      # ⭐️ THE KEY STEP: Use spark_read_csv for efficient loading ⭐️
+      # This reads the CSV in a distributed, parallel fashion,
+      # registers it as a lazy table in Spark, and handles the header.
+      sparklyr::spark_read_csv(
+        sc = sc,
+        name = full_table_name,
+        path = spark_file_path,
+        header = TRUE,
+        infer_schema = TRUE, # Infers column data types from the data
+        overwrite = TRUE, # Overwrite if table exists (can change to FALSE if preferred)
+        options = list(maxColumns = 40000L) # Set a value greater than 32768
+      )
+      cat(" - Registered table:", full_table_name, "\n")
+    }
+  }
+}
+```
+
+
+```{r}
+# 1. Define the folder names (your "G" folders)
+g_folders <- paste0("G_", 1:1)
+
+# 2. Define the CSV file names
+# Use a pattern that matches "channel_1.csv" through "channel_11.csv"
+csv_files <- paste0("channel_", 1:1, ".csv")
+
+# 3. Connect to the DuckDB database (or create it if it doesn't exist)
+con <- dbConnect(duckdb::duckdb(), "large_data_warehouse.duckdb")
+
+# 4. Loop through the folders to create schemas and load tables
+for (g_folder in g_folders) {
+  # A. Use the folder name as the schema name
+  schema_name <- g_folder
+
+  # B. Create the schema (this acts as your folder)
+  DBI::dbExecute(con, paste("CREATE SCHEMA IF NOT EXISTS", schema_name))
+  cat("Created schema:", schema_name, "\n")
+
+  # C. Loop through the CSVs within the current folder
+  for (csv_file in csv_files) {
+    # Construct the full file path for the CSV
+
+    base_path <- "G:/My Drive/rao@ualberta.ca 2022-12-08 10 58/shishir@tamu.edu/My Drive/Interesting papers/Survival Models/Reliability/RUL Challenge/rul_challenge_data/rul_challenge_data/train"
+
+    full_path <- paste0(base_path, "/", g_folder, "/", csv_file)
+
+    # Check if the specific file exists before trying to load it
+    if (file.exists(full_path)) {
+      # The table name will be the CSV file name (e.g., 'channel_1')
+      table_name <- sub(".csv$", "", csv_file)
+
+      # Construct the full SQL table name: schema.table (e.g., G_1.channel_1)
+      full_table_name <- paste0(schema_name, ".", table_name)
+
+      # Option A: let DuckDB read the CSV directly (fast, avoids R memory)
+      full_path_escaped <- gsub("'", "''", full_path) # escape single quotes if any
+      sql <- paste0(
+        "CREATE TABLE ",
+        full_table_name,
+        " AS SELECT * FROM read_csv_auto('",
+        full_path_escaped,
+        "')"
+      )
+      DBI::dbExecute(con, sql)
+
+      # # Load the large CSV directly into the DuckDB table
+      # # Use dbplyr/DBI to run the appropriate SQL for bulk loading
+      # dbWriteTable(
+      #   conn = con,
+      #   name = full_table_name,
+      #   value = full_path, # DuckDB efficiently reads the file from this path
+      #   header = TRUE,
+      #   row.names = FALSE,
+      #   overwrite = TRUE
+      # )
+      cat("  - Loaded table:", full_table_name, "\n")
+    }
+  }
+}
+```
+
+```{r}
+G_1_channel_1 <- read.csv(
+  "G:\\My Drive\\rao@ualberta.ca 2022-12-08 10 58\\shishir@tamu.edu\\My Drive\\Interesting papers\\Survival Models\\Reliability\\RUL Challenge\\rul_challenge_data\\rul_challenge_data\\train\\G_1\\channel_1.csv"
+)
+```
+
+ROUGH
+
+
+```{r}
+# 1. Find the path to your default user library
+default_library_path <- .libPaths()[[1]]
+
+# 2. Install the package explicitly to that path
+install.packages("DBI", lib = default_library_path)
+```

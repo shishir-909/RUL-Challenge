@@ -1,0 +1,11 @@
+﻿large_data_warehouse.duckdb
+rul_challenge_data/
+parquet/
+*.parquet
+*.csv
+.Rhistory
+.RData
+.Rproj.user
+renv/library/
+renv/staging/
+.DS_Store
