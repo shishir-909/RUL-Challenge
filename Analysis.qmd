@@ -1,0 +1,621 @@
+---
+title: "Analysis"
+format: html
+---
+
+This document plots the time domain and spectral kurtosis features from the RUL challenge dataset using plotly slide shows. It also saves the slide shows as HTML files in the respective folders.
+
+```{r}
+
+# renv::install("signal")
+# renv::install("e1071")
+# renv::install("av")
+# renv::install("future")
+# renv::install("furrr")
+# renv::install("plotly")
+# renv::install("htmlwidgets")
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(sparklyr)
+library(signal)
+library(e1071)
+library(av)
+library(parallel)
+library(future)
+library(furrr)
+library(data.table)
+library(plotly)
+library(htmlwidgets)
+```
+
+Load the time domain and spectral kurtosis features .rds files.
+
+
+```{r}
+time_domain_features <- readRDS(
+  "G:\\My Drive\\rao@ualberta.ca 2022-12-08 10 58\\shishir@tamu.edu\\My Drive\\Interesting papers\\Survival Models\\Reliability\\RUL Challenge\\RUL-challenge\\G_1\\channel_1\\time_domain_features.rds"
+)
+spectral_kurtosis_features <- readRDS(
+  "G:\\My Drive\\rao@ualberta.ca 2022-12-08 10 58\\shishir@tamu.edu\\My Drive\\Interesting papers\\Survival Models\\Reliability\\RUL Challenge\\RUL-challenge\\G_1\\channel_1\\sk_summary_features.rds"
+)
+```
+
+Every column in every element in the time domain features and spectral kurtosis features is a feature. I want to plot this against time. Every list element is the feature value at 2 minute intervals. For example, the first list element is at 2 minutes, the second is at 4 minutes and so on. I want a function that takes in both the lists and plots every feature against time in a plotly slide show. In the slide show, I want an option to play, move ahead 1 step or move back one step. After writing that function, I want a code that loops through all the folders and all the channels by calling that function iteratively. Every plotly slide show should be saved as an html file in the respective folder of the channel.
+
+Here is the function that creates the plotly slide show for the features:
+
+
+```{r}
+create_feature_timeseries_slideshow <- function(
+  time_domain_features,
+  spectral_kurtosis_features,
+  output_file = "feature_timeseries.html",
+  time_interval_minutes = 2
+) {
+  # Convert lists to data frames
+  td_df <- bind_rows(time_domain_features, .id = "signal_id")
+  sk_df <- bind_rows(spectral_kurtosis_features, .id = "signal_id")
+
+  # Combine both feature sets
+  combined_df <- bind_cols(td_df, sk_df |> select(-signal_id))
+
+  # Add time column
+  combined_df <- combined_df |>
+    mutate(
+      signal_id = as.integer(signal_id),
+      Time_minutes = signal_id * time_interval_minutes
+    )
+
+  # Get all feature names (exclude signal_id and Time_minutes)
+  feature_names <- setdiff(names(combined_df), c("signal_id", "Time_minutes"))
+
+  # Reshape to long format for plotting
+  plot_data <- combined_df |>
+    select(Time_minutes, all_of(feature_names)) |>
+    pivot_longer(
+      cols = all_of(feature_names),
+      names_to = "Feature",
+      values_to = "Value"
+    )
+
+  # Calculate y-axis range for each feature
+  feature_ranges <- plot_data |>
+    group_by(Feature) |>
+    summarize(
+      ymin = min(Value, na.rm = TRUE),
+      ymax = max(Value, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(
+      # Add 5% padding to y-axis range
+      padding = (ymax - ymin) * 0.05,
+      ymin = ymin - padding,
+      ymax = ymax + padding
+    )
+
+  # Create frames manually with proper y-axis ranges
+  frames <- lapply(feature_names, function(feat) {
+    feat_data <- plot_data |> filter(Feature == feat)
+    feat_range <- feature_ranges |> filter(Feature == feat)
+
+    list(
+      data = list(
+        list(
+          x = feat_data$Time_minutes,
+          y = feat_data$Value,
+          type = "scatter",
+          mode = "lines+markers",
+          marker = list(size = 6),
+          line = list(width = 2)
+        )
+      ),
+      name = feat,
+      layout = list(
+        yaxis = list(
+          range = c(feat_range$ymin, feat_range$ymax),
+          title = "Feature Value"
+        )
+      )
+    )
+  })
+
+  # Create initial plot with first feature
+  first_feature_data <- plot_data |> filter(Feature == feature_names[1])
+  first_range <- feature_ranges |> filter(Feature == feature_names[1])
+
+  fig <- plot_ly() |>
+    add_trace(
+      data = first_feature_data,
+      x = ~Time_minutes,
+      y = ~Value,
+      type = 'scatter',
+      mode = 'lines+markers',
+      marker = list(size = 6),
+      line = list(width = 2)
+    ) |>
+    layout(
+      title = "Feature Evolution Over Time",
+      xaxis = list(title = "Time (minutes)"),
+      yaxis = list(
+        title = "Feature Value",
+        range = c(first_range$ymin, first_range$ymax)
+      ),
+      updatemenus = list(
+        list(
+          type = "buttons",
+          direction = "right",
+          x = 0.7,
+          y = 1.15,
+          buttons = list(
+            list(
+              label = "Play",
+              method = "animate",
+              args = list(
+                NULL,
+                list(
+                  frame = list(duration = 500, redraw = TRUE),
+                  fromcurrent = TRUE,
+                  mode = "immediate",
+                  transition = list(duration = 300)
+                )
+              )
+            ),
+            list(
+              label = "Pause",
+              method = "animate",
+              args = list(
+                list(NULL),
+                list(
+                  frame = list(duration = 0, redraw = FALSE),
+                  mode = "immediate",
+                  transition = list(duration = 0)
+                )
+              )
+            )
+          )
+        )
+      ),
+      sliders = list(
+        list(
+          active = 0,
+          steps = lapply(seq_along(feature_names), function(i) {
+            list(
+              label = feature_names[i],
+              method = "animate",
+              args = list(
+                list(feature_names[i]),
+                list(
+                  mode = "immediate",
+                  frame = list(duration = 300, redraw = TRUE),
+                  transition = list(duration = 300)
+                )
+              )
+            )
+          }),
+          currentvalue = list(
+            prefix = "Feature: ",
+            visible = TRUE,
+            xanchor = "center"
+          ),
+          len = 0.9,
+          x = 0.05,
+          y = 0,
+          pad = list(t = 50, b = 10)
+        )
+      )
+    )
+
+  # Add frames to the figure
+  fig$x$frames <- frames
+
+  # Save as HTML
+  saveWidget(fig, output_file, selfcontained = TRUE)
+
+  cat("Slideshow saved to:", normalizePath(output_file), "\n")
+
+  return(invisible(fig))
+}
+```
+
+Test the function with the loaded features.
+
+
+```{r}
+create_feature_timeseries_slideshow(
+  time_domain_features,
+  spectral_kurtosis_features,
+  output_file = "feature_timeseries.html"
+)
+```
+
+Now, to loop through all the folders and channels, you can use the following code. Make sure to adjust the base directory path as needed.
+
+
+```{r}
+# Define base directory and schemas
+base_dir <- "G:\\My Drive\\rao@ualberta.ca 2022-12-08 10 58\\shishir@tamu.edu\\My Drive\\Interesting papers\\Survival Models\\Reliability\\RUL Challenge\\RUL-challenge"
+
+# Define all schemas
+train_schemas <- c("G_1", "G_2", "G_3", "G_4", "G_5")
+test_schemas <- paste0("G_6_test_", 1:5)
+all_schemas <- c(train_schemas, test_schemas)
+
+# Define channels
+channels <- c(
+  "channel_1",
+  "channel_2",
+  "channel_3",
+  "channel_4",
+  "channel_5",
+  "channel_6",
+  "channel_7",
+  "channel_8",
+  "channel_9",
+  "channel_10",
+  "channel_11"
+)
+
+# Process all combinations
+results_log <- list()
+
+for (schema in all_schemas) {
+  cat("\n=== Processing Schema:", schema, "===\n")
+
+  for (channel in channels) {
+    folder_path <- file.path(base_dir, schema, channel)
+
+    # Check if folder exists
+    if (!dir.exists(folder_path)) {
+      cat("Skipping", schema, "/", channel, "- folder not found\n")
+      next
+    }
+
+    # Define file paths
+    td_file <- file.path(folder_path, "time_domain_features.rds")
+    sk_file <- file.path(folder_path, "sk_summary_features.rds")
+
+    # Check if both files exist
+    if (!file.exists(td_file) || !file.exists(sk_file)) {
+      cat("Skipping", schema, "/", channel, "- missing feature files\n")
+      next
+    }
+
+    cat("Processing:", schema, "/", channel, "\n")
+
+    # Load features
+    tryCatch(
+      {
+        time_domain_features <- readRDS(td_file)
+        spectral_kurtosis_features <- readRDS(sk_file)
+
+        # Create output file path
+        output_html <- file.path(folder_path, "feature_timeseries.html")
+
+        # Generate slideshow
+        create_feature_timeseries_slideshow(
+          time_domain_features = time_domain_features,
+          spectral_kurtosis_features = spectral_kurtosis_features,
+          output_file = output_html,
+          time_interval_minutes = 2
+        )
+
+        results_log[[length(results_log) + 1]] <- list(
+          schema = schema,
+          channel = channel,
+          status = "success",
+          n_signals = length(time_domain_features)
+        )
+
+        cat("  ✓ Completed:", channel, "\n")
+      },
+      error = function(e) {
+        cat("  ✗ Error processing", channel, ":", e$message, "\n")
+        results_log[[length(results_log) + 1]] <- list(
+          schema = schema,
+          channel = channel,
+          status = "error",
+          error = e$message
+        )
+      }
+    )
+  }
+}
+
+# Convert results log to data frame
+results_df <- bind_rows(results_log)
+
+cat("\n=== Processing Complete ===\n")
+cat("Total successful:", sum(results_df$status == "success"), "\n")
+cat("Total errors:", sum(results_df$status == "error"), "\n")
+
+# Save results log
+saveRDS(results_df, file.path(base_dir, "feature_slideshow_results.rds"))
+```
+
+Next, I want to do something similar in terms of a plotly slide show, but this time, I want all gearboxes for a particular channel on the same slide show. For example, for channel 1, I want all the gearboxes G_1 to G_5 and G_6_test_1 to G_6_test_5 plotted in the same slide show. The x axis will still be time in minutes, but now, every feature will have 10 lines - one for each gearbox. The y axis will still be the feature value. The slide show should have the same play, move ahead 1 step and move back 1 step options. Every plotly slide show should be saved as an html file in a new folder called "all_gearboxes" inside the base directory.
+
+Function to create the combined gearbox slide show:
+
+```{r}
+create_multi_gearbox_slideshow <- function(
+  channel_name,
+  all_schemas,
+  base_dir,
+  output_file,
+  time_interval_minutes = 2
+) {
+  # Collect data from all gearboxes for this channel
+  all_gearbox_data <- list()
+
+  for (schema in all_schemas) {
+    folder_path <- file.path(base_dir, schema, channel_name)
+
+    # Check if folder and files exist
+    td_file <- file.path(folder_path, "time_domain_features.rds")
+    sk_file <- file.path(folder_path, "sk_summary_features.rds")
+
+    if (
+      !dir.exists(folder_path) || !file.exists(td_file) || !file.exists(sk_file)
+    ) {
+      cat("Skipping", schema, "- missing data\n")
+      next
+    }
+
+    # Load features
+    tryCatch(
+      {
+        td_features <- readRDS(td_file)
+        sk_features <- readRDS(sk_file)
+
+        # Convert to data frames
+        td_df <- bind_rows(td_features, .id = "signal_id")
+        sk_df <- bind_rows(sk_features, .id = "signal_id")
+
+        # Combine and add metadata
+        combined <- bind_cols(td_df, sk_df |> select(-signal_id)) |>
+          mutate(
+            signal_id = as.integer(signal_id),
+            Time_minutes = signal_id * time_interval_minutes,
+            Gearbox = schema
+          )
+
+        all_gearbox_data[[schema]] <- combined
+      },
+      error = function(e) {
+        cat("Error loading", schema, ":", e$message, "\n")
+      }
+    )
+  }
+
+  # Check if we have data
+  if (length(all_gearbox_data) == 0) {
+    stop("No data found for channel ", channel_name)
+  }
+
+  # Combine all gearbox data
+  combined_df <- bind_rows(all_gearbox_data)
+
+  # Get feature names (exclude metadata columns)
+  feature_names <- setdiff(
+    names(combined_df),
+    c("signal_id", "Time_minutes", "Gearbox")
+  )
+
+  # Reshape to long format
+  plot_data <- combined_df |>
+    select(Time_minutes, Gearbox, all_of(feature_names)) |>
+    pivot_longer(
+      cols = all_of(feature_names),
+      names_to = "Feature",
+      values_to = "Value"
+    )
+
+  # Calculate y-axis range for each feature across all gearboxes
+  feature_ranges <- plot_data |>
+    group_by(Feature) |>
+    summarize(
+      ymin = min(Value, na.rm = TRUE),
+      ymax = max(Value, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(
+      padding = (ymax - ymin) * 0.05,
+      ymin = ymin - padding,
+      ymax = ymax + padding
+    )
+
+  # Create frames for each feature
+  frames <- lapply(feature_names, function(feat) {
+    feat_data <- plot_data |> filter(Feature == feat)
+    feat_range <- feature_ranges |> filter(Feature == feat)
+
+    # Create a trace for each gearbox
+    traces <- lapply(unique(feat_data$Gearbox), function(gb) {
+      gb_data <- feat_data |> filter(Gearbox == gb)
+      list(
+        x = gb_data$Time_minutes,
+        y = gb_data$Value,
+        type = "scatter",
+        mode = "lines+markers",
+        name = gb,
+        marker = list(size = 4),
+        line = list(width = 2)
+      )
+    })
+
+    list(
+      data = traces,
+      name = feat,
+      layout = list(
+        yaxis = list(
+          range = c(feat_range$ymin, feat_range$ymax),
+          title = "Feature Value"
+        )
+      )
+    )
+  })
+
+  # Create initial plot with first feature
+  first_feature_data <- plot_data |> filter(Feature == feature_names[1])
+  first_range <- feature_ranges |> filter(Feature == feature_names[1])
+
+  fig <- plot_ly()
+
+  # Add traces for each gearbox for the first feature
+  for (gb in unique(first_feature_data$Gearbox)) {
+    gb_data <- first_feature_data |> filter(Gearbox == gb)
+    fig <- fig |>
+      add_trace(
+        data = gb_data,
+        x = ~Time_minutes,
+        y = ~Value,
+        type = 'scatter',
+        mode = 'lines+markers',
+        name = gb,
+        marker = list(size = 4),
+        line = list(width = 2)
+      )
+  }
+
+  # Add layout with controls
+  fig <- fig |>
+    layout(
+      title = paste("Feature Evolution Over Time -", channel_name),
+      xaxis = list(title = "Time (minutes)"),
+      yaxis = list(
+        title = "Feature Value",
+        range = c(first_range$ymin, first_range$ymax)
+      ),
+      updatemenus = list(
+        list(
+          type = "buttons",
+          direction = "right",
+          x = 0.7,
+          y = 1.15,
+          buttons = list(
+            list(
+              label = "Play",
+              method = "animate",
+              args = list(
+                NULL,
+                list(
+                  frame = list(duration = 500, redraw = TRUE),
+                  fromcurrent = TRUE,
+                  mode = "immediate",
+                  transition = list(duration = 300)
+                )
+              )
+            ),
+            list(
+              label = "Pause",
+              method = "animate",
+              args = list(
+                list(NULL),
+                list(
+                  frame = list(duration = 0, redraw = FALSE),
+                  mode = "immediate",
+                  transition = list(duration = 0)
+                )
+              )
+            )
+          )
+        )
+      ),
+      sliders = list(
+        list(
+          active = 0,
+          steps = lapply(seq_along(feature_names), function(i) {
+            list(
+              label = feature_names[i],
+              method = "animate",
+              args = list(
+                list(feature_names[i]),
+                list(
+                  mode = "immediate",
+                  frame = list(duration = 300, redraw = TRUE),
+                  transition = list(duration = 300)
+                )
+              )
+            )
+          }),
+          currentvalue = list(
+            prefix = "Feature: ",
+            visible = TRUE,
+            xanchor = "center"
+          ),
+          len = 0.9,
+          x = 0.05,
+          y = 0,
+          pad = list(t = 50, b = 10)
+        )
+      )
+    )
+
+  # Add frames
+  fig$x$frames <- frames
+
+  # Save as HTML
+  saveWidget(fig, output_file, selfcontained = TRUE)
+
+  cat("Multi-gearbox slideshow saved to:", normalizePath(output_file), "\n")
+
+  return(invisible(fig))
+}
+```
+
+Loop through all channels to create the multi-gearbox slide shows:
+
+
+```{r}
+# Create output directory
+output_dir <- file.path(base_dir, "all_gearboxes")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Process each channel
+channel_results <- list()
+
+for (channel in channels) {
+  cat("\n=== Processing Channel:", channel, "===\n")
+
+  output_file <- file.path(output_dir, paste0(channel, "_all_gearboxes.html"))
+
+  tryCatch(
+    {
+      create_multi_gearbox_slideshow(
+        channel_name = channel,
+        all_schemas = all_schemas,
+        base_dir = base_dir,
+        output_file = output_file,
+        time_interval_minutes = 2
+      )
+
+      channel_results[[length(channel_results) + 1]] <- list(
+        channel = channel,
+        status = "success"
+      )
+
+      cat("✓ Completed:", channel, "\n")
+    },
+    error = function(e) {
+      cat("✗ Error processing", channel, ":", e$message, "\n")
+      channel_results[[length(channel_results) + 1]] <- list(
+        channel = channel,
+        status = "error",
+        error = e$message
+      )
+    }
+  )
+}
+
+# Convert results to data frame
+channel_results_df <- bind_rows(channel_results)
+
+cat("\n=== Multi-Gearbox Processing Complete ===\n")
+cat("Total successful:", sum(channel_results_df$status == "success"), "\n")
+cat("Total errors:", sum(channel_results_df$status == "error"), "\n")
+
+# Save results log
+saveRDS(channel_results_df, file.path(output_dir, "multi_gearbox_results.rds"))
+```
