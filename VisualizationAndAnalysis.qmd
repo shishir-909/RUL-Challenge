@@ -1,0 +1,755 @@
+---
+title: "Visualizations and Analysis"
+format: html
+---
+
+```{r}
+
+# renv::install("signal")
+# renv::install("e1071")
+# renv::install("av")
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(sparklyr)
+library(signal)
+library(e1071)
+library(av)
+```
+
+Connect to DuckDB
+
+```{r}
+# Connect to the DuckDB database (or create it if it doesn't exist)
+con <- dbConnect(
+  duckdb::duckdb(),
+  "C:\\Users\\shish\\Documents\\rul_challenge_data\\DuckDB\\large_data_warehouse.duckdb"
+)
+```
+
+Connect and load the first table
+
+```{r}
+# Lazy table connection to G_1.channel_1
+
+g1_channel1_lazy <- tbl(con, "G_1.channel_1")
+
+g1_channel1_lazy_df <- g1_channel1_lazy %>%
+  collect()
+
+```
+
+For every row (i.e. signal), compute the spectral kurtosis using differnt window sizes.
+
+```{r}
+
+start_time <- Sys.time()
+
+# Generate row indices for all rows in the data frame
+row_indices <- seq(1, nrow(g1_channel1_lazy_df), by = 1)
+
+# Initialize list to store plots
+plot_list <- list()
+
+# Initialize list to store results_list from each signal
+all_signals_results <- list()
+
+# Loop through each selected row index
+for (idx in seq_along(row_indices)) {
+  row_num <- row_indices[idx]
+
+  # Pull signal from the selected row
+  final_signal <- g1_channel1_lazy_df[row_num, ]
+
+  # Extract signal vector
+  x <- final_signal[1, ] |> unlist() |> as.numeric()
+
+  # Set parameters
+  Fs <- 12800
+  window_lengths <- c(16, 32, 64, 128, 256)
+  results_list <- list()
+
+  # Compute spectral kurtosis for different window lengths
+  for (w_len in window_lengths) {
+    o_len <- 0.8 * w_len
+
+    spec_output <- specgram(
+      x,
+      n = 1024,
+      Fs = Fs,
+      overlap = o_len,
+      window = hanning(w_len)
+    )
+    P_matrix <- Mod(spec_output$S)^2
+    freq_bins <- spec_output$f
+
+    # Exclude DC bin
+    P_data <- P_matrix[-c(1), ]
+    freq_data <- freq_bins[-c(1)]
+
+    num_freq_bins <- nrow(P_data)
+    sk_values <- numeric(num_freq_bins)
+
+    for (i in 1:num_freq_bins) {
+      energy_envelope <- P_data[i, ]
+      sk_values[i] <- e1071::kurtosis(energy_envelope, type = 1) + 1
+    }
+
+    # Calculate area under the SK curve using base R
+    # 1. Calculate the average height of each trapezoid: (y_i + y_{i+1}) / 2
+    average_heights <- (sk_values[-length(sk_values)] + sk_values[-1]) / 2
+
+    # 2. Calculate the width of each trapezoid: (x_{i+1} - x_i)
+    # diff(freq_data) calculates the difference between consecutive elements
+    widths <- diff(freq_data)
+
+    # 3. Sum the areas (height * width)
+    area_under_sk_base_r <- sum(average_heights * widths)
+
+    results_list[[as.character(w_len)]] <- data.frame(
+      Frequency_kHz = freq_data / 1000,
+      SK = sk_values,
+      Window_Size = as.factor(w_len),
+      Area_Under_SK = area_under_sk_base_r
+    )
+  }
+
+  # Combine results
+  plotting_df <- do.call(rbind, results_list)
+
+  # Create plot
+  p <- ggplot(
+    plotting_df,
+    aes(x = Frequency_kHz, y = SK, color = Window_Size)
+  ) +
+    geom_line(linewidth = 1) +
+    labs(
+      title = paste0("Spectral Kurtosis - Signal Row ", row_num),
+      x = "Frequency [kHz]",
+      y = "Spectral Kurtosis",
+      color = "Window Length (Nw)"
+    ) +
+    scale_x_continuous(limits = c(0, Fs / 2000)) +
+    scale_y_continuous(limits = c(0, 70)) +
+    theme_minimal() +
+    theme(legend.position = "right")
+
+  # Store plot in list
+  plot_list[[idx]] <- p
+
+  # Store results_list in all_signals_results
+  all_signals_results[[idx]] <- plotting_df
+
+  #cat("Processed signal", idx, "of 10 (row", row_num, ")\n")
+
+  cat(
+    "Processed signal",
+    idx,
+    "of",
+    length(row_indices),
+    "(row",
+    row_num,
+    ")\n"
+  )
+}
+
+end_time <- Sys.time()
+time_taken <- end_time - start_time
+cat("Total time taken:", time_taken, "\n")
+
+```
+
+Save all_signals_results for future analysis
+
+```{r}
+# Save plot_list and all_signals_results for future analysis
+
+# saveRDS(plot_list, "spectral_kurtosis_plots_list.rds")
+saveRDS(
+  all_signals_results,
+  "G1_channel1_spectral_kurtosis_all_signals_results.rds"
+)
+```
+
+Create a video of the plots in plot_list
+
+```{r}
+library(av)
+
+# Create temporary directory
+temp_dir <- "temp_plots"
+dir.create(temp_dir, showWarnings = FALSE)
+
+# Save plots as temporary images
+for (i in seq_along(plot_list)) {
+  temp_file <- file.path(temp_dir, sprintf("plot_%04d.png", i))
+  ggsave(temp_file, plot = plot_list[[i]], width = 10, height = 7, dpi = 100)
+
+  if (i %% 100 == 0) cat("Processing", i, "of", length(plot_list), "plots\n")
+}
+
+# Create video from images
+av_encode_video(
+  input = list.files(temp_dir, pattern = "plot_.*\\.png", full.names = TRUE),
+  output = "spectral_kurtosis_video.mp4",
+  framerate = 10, # 10 frames per second
+  vfilter = "format=yuv420p" # Better compatibility
+)
+
+# Clean up
+unlink(temp_dir, recursive = TRUE)
+
+
+```
+
+Load all_signals_results for analysis. Then, I want to plot area under spectral kurtosis against signal index for all window sizes.
+
+
+```{r}
+G1_channel1_spectral_kurtosis_all_signals_results <- readRDS(
+  "G1_channel2_spectral_kurtosis_all_signals_results.rds"
+)
+
+# plot area under spectral kurtosis against signal index for all window sizes.
+# Combine area under SK data for all signals
+area_data <- data.frame()
+for (i in seq_along(G1_channel1_spectral_kurtosis_all_signals_results)) {
+  signal_df <- G1_channel1_spectral_kurtosis_all_signals_results[[i]]
+
+  # Extract unique area under SK values for each window size
+  area_values <- signal_df %>%
+    select(Window_Size, Area_Under_SK) %>%
+    distinct()
+
+  area_values$Signal_Index <- i
+
+  area_data <- rbind(area_data, area_values)
+}
+
+area_data_filtered <- area_data %>%
+  dplyr::filter(Window_Size %in% c("32"))
+
+# Plot area under SK vs Signal Index for all window sizes
+p_area <- ggplot(
+  area_data_filtered,
+  aes(x = Signal_Index, y = Area_Under_SK, color = Window_Size)
+) +
+  geom_line() +
+  labs(
+    title = "Area Under Spectral Kurtosis vs Signal Index",
+    x = "Signal Index",
+    y = "Area Under Spectral Kurtosis",
+    color = "Window Length (Nw)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+p_area
+```
+
+Write a function that takes in a channel, calculates the following, and stores them in a data frame:
+
+1. Time domain features (mean, std, peak to peak, rms, skewness, kurtosis, crest factor, shape factor, impulse factor, margin factor, energy) for every row in the channel and stores it in a list. Each list element contains the time domain features for one signal (row).
+2. Calculate the spectral kurtosis for every row in the channel using different window sizes (16, 32, 64, 128, 256) and stores them in a list. Each list element contains a data frame with frequency, spectral kurtosis values, window size for one signal (row).
+3. Create a new list where each element contains a dataframe with columns as window size, mean spectral kurtosis, std. dev spectral kurtosis, kurtosis-spectral kurtosis, skewness-spectral kurtosis, peak-to-peak spectral kurtosis and area under curve spectral kurtosis. This data frame is built based on the data in point 2 above. Note that only the frequencies between 500 Hz and 5500 Hz from the data frames in point 2 above must be used. Each list element is for one signal (row)
+
+
+```{r}
+
+calculate_vibration_timeDomainFeatures <- function(signal_vector) {
+  # --- Intermediate Calculations ---
+  abs_signal <- abs(signal_vector)
+
+  # Peak Value (Maximum Absolute Amplitude, xp)
+  peak_value <- max(abs_signal)
+
+  # RMS: Root Mean Square
+  rms_value <- sqrt(mean(signal_vector^2))
+
+  # Absolute Mean (Mean of the absolute values, or Rectified Mean)
+  abs_mean <- mean(abs_signal)
+
+  # Denominator for Margin Factor
+  # Formula: ( 1/N * sum(|x_i|) )^2
+  margin_denominator <- (abs_mean)^2
+
+  # --- Feature Calculations ---
+  results <- list(
+    # Basic Stats
+    Mean = mean(signal_vector),
+    Std_Dev = sd(signal_vector),
+    Peak_to_Peak = max(signal_vector) - min(signal_vector),
+    RMS = rms_value,
+
+    # Statistical Moments
+    Skewness = skewness(signal_vector),
+    Kurtosis = kurtosis(signal_vector),
+
+    # Factors (using the robust peak_value = max(|x|))
+    Crest_Factor = peak_value / rms_value,
+    Shape_Factor = rms_value / abs_mean,
+    Impulse_Factor = peak_value / abs_mean,
+
+    # Margin Factor (Denominator: Squared Mean of the Absolute Values)
+    Margin_Factor = peak_value / margin_denominator,
+
+    # Energy
+    Energy = sum(signal_vector^2) # Sum of Squares
+  )
+
+  return(results)
+}
+
+
+process_channel_features <- function(channel_data, Fs = 12800) {
+  # Initialize output lists
+  time_domain_features_list <- list()
+  spectral_kurtosis_list <- list()
+  sk_summary_features_list <- list()
+
+  # Get number of signals (rows)
+  n_signals <- nrow(channel_data)
+
+  # Process each signal
+  for (row_idx in 1:n_signals) {
+    # --- 1. Extract signal ---
+    signal_vector <- channel_data[row_idx, ] |> unlist() |> as.numeric()
+
+    # --- 2. Calculate Time Domain Features ---
+    time_features <- calculate_vibration_timeDomainFeatures(signal_vector)
+    time_domain_features_list[[row_idx]] <- as.data.frame(time_features)
+
+    # --- 3. Calculate Spectral Kurtosis ---
+    window_lengths <- c(16, 32, 64, 128, 256)
+    results_list <- list()
+
+    for (w_len in window_lengths) {
+      o_len <- 0.8 * w_len
+
+      # Compute spectrogram
+      spec_output <- specgram(
+        signal_vector,
+        n = 1024,
+        Fs = Fs,
+        overlap = o_len,
+        window = hanning(w_len)
+      )
+
+      P_matrix <- Mod(spec_output$S)^2
+      freq_bins <- spec_output$f
+
+      # Exclude DC bin
+      P_data <- P_matrix[-1, ]
+      freq_data <- freq_bins[-1]
+
+      # Calculate SK for each frequency bin
+      num_freq_bins <- nrow(P_data)
+      sk_values <- numeric(num_freq_bins)
+
+      for (i in 1:num_freq_bins) {
+        energy_envelope <- P_data[i, ]
+        sk_values[i] <- e1071::kurtosis(energy_envelope, type = 1) + 1
+      }
+
+      # Store SK results
+      results_list[[as.character(w_len)]] <- data.frame(
+        Frequency_Hz = freq_data,
+        SK = sk_values,
+        Window_Size = as.factor(w_len)
+      )
+    }
+
+    # Combine all window sizes for this signal
+    spectral_kurtosis_list[[row_idx]] <- do.call(rbind, results_list)
+
+    # --- 4. Calculate SK Summary Features (500-5500 Hz) ---
+    sk_summary_df <- data.frame()
+
+    for (w_len in window_lengths) {
+      # Filter data for this window size and frequency range
+      sk_data <- results_list[[as.character(w_len)]] |>
+        dplyr::filter(Frequency_Hz >= 500 & Frequency_Hz <= 5500)
+
+      # Extract SK values in the frequency range
+      sk_vals <- sk_data$SK
+      freq_vals <- sk_data$Frequency_Hz
+
+      # Calculate area under curve using trapezoidal rule
+      average_heights <- (sk_vals[-length(sk_vals)] + sk_vals[-1]) / 2
+      widths <- diff(freq_vals)
+      area_under_curve <- sum(average_heights * widths)
+
+      # Calculate summary statistics
+      summary_row <- data.frame(
+        Window_Size = w_len,
+        Mean_SK = mean(sk_vals, na.rm = TRUE),
+        StdDev_SK = sd(sk_vals, na.rm = TRUE),
+        Kurtosis_SK = e1071::kurtosis(sk_vals),
+        Skewness_SK = e1071::skewness(sk_vals),
+        PeakToPeak_SK = max(sk_vals, na.rm = TRUE) - min(sk_vals, na.rm = TRUE),
+        AUC_SK = area_under_curve
+      )
+
+      sk_summary_df <- rbind(sk_summary_df, summary_row)
+    }
+
+    sk_summary_features_list[[row_idx]] <- sk_summary_df
+
+    # Progress indicator
+    if (row_idx %% 100 == 0) {
+      cat("Processed signal", row_idx, "of", n_signals, "\n")
+    }
+  }
+
+  # Return all three lists
+  return(list(
+    time_domain_features = time_domain_features_list,
+    spectral_kurtosis = spectral_kurtosis_list,
+    sk_summary_features = sk_summary_features_list
+  ))
+}
+```
+
+Loop through all channels
+
+```{r}
+# Define schemas and channels
+schemas <- c("G_1", "G_2", "G_3", "G_4", "G_5")
+channels <- c(
+  "channel_1",
+  "channel_2",
+  "channel_3",
+  "channel_4",
+  "channel_5",
+  "channel_6",
+  "channel_11"
+)
+
+# Get list of all available tables in the database
+all_tables <- dbListTables(con)
+
+# Process each schema
+for (schema in schemas) {
+  cat("\n=== Processing Schema:", schema, "===\n")
+
+  # Process each channel
+  for (channel in channels) {
+    table_name <- paste0(schema, ".", channel)
+
+    # Check if table exists
+    if (!table_name %in% all_tables) {
+      cat("Table", table_name, "does not exist. Skipping.\n")
+      next
+    }
+
+    cat("\nProcessing:", table_name, "\n")
+
+    # Create output directory structure
+    output_dir <- file.path(schema, channel)
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+    # Connect to the channel lazily
+    channel_lazy <- tbl(con, table_name)
+
+    # Collect data into memory
+    channel_data <- channel_lazy |> collect()
+
+    cat("Loaded", nrow(channel_data), "signals from", table_name, "\n")
+
+    # Process the channel
+    start_time <- Sys.time()
+    results <- process_channel_features(channel_data, Fs = 12800)
+    end_time <- Sys.time()
+
+    cat(
+      "Processing completed in",
+      round(difftime(end_time, start_time, units = "mins"), 2),
+      "minutes\n"
+    )
+
+    # Save results
+    saveRDS(
+      results$time_domain_features,
+      file.path(output_dir, "time_domain_features.rds")
+    )
+
+    saveRDS(
+      results$spectral_kurtosis,
+      file.path(output_dir, "spectral_kurtosis.rds")
+    )
+
+    saveRDS(
+      results$sk_summary_features,
+      file.path(output_dir, "sk_summary_features.rds")
+    )
+
+    cat("Results saved to:", output_dir, "\n")
+
+    # Clear channel data from memory
+    rm(channel_data, channel_lazy, results)
+    gc() # Force garbage collection
+
+    cat("Memory cleared for next channel\n")
+  }
+}
+
+cat("\n=== All channels processed successfully ===\n")
+```
+
+
+##
+
+```{r}
+g1_channel1_lazy <- tbl(con, "G_1.channel_1")
+
+# Last row index
+
+last_row_index <- g1_channel1_lazy %>%
+  summarise(row_count = n()) %>%
+  collect() %>%
+  pull(row_count)
+
+# Pull last row from the table
+final_signal <- g1_channel1_lazy %>%
+  dplyr::filter(row_number() == last_row_index) %>%
+  collect()
+
+# store "x" as a vector for analysis
+
+x <- final_signal[1, ] %>% unlist() %>% as.numeric()
+
+
+# Replication of Figure 19(b) using ggplot2 in R
+# --- 1. Define Parameters and Data ---
+
+Fs <- 12800 # Sampling Frequency (Hz)
+N <- length(final_signal) # Total Length of signal (32768 samples)
+
+# # Simulated Signal: Stationary noise + Non-stationary impulses (fault)
+# t <- (1:N) / Fs
+# x <- sin(2 * pi * 100 * t) + 0.1 * rnorm(N)
+# # Add sharp impulses repeating at 50 Hz
+# impulse_indices <- seq(1, N, by = round(Fs / 50))
+# x[impulse_indices] <- x[impulse_indices] + 5
+# x <- as.numeric(x)
+
+# Window lengths to test (from Figure 19b)
+window_lengths <- c(16, 32, 64, 128, 256)
+
+# Data structure to hold all SK results
+results_list <- list()
+
+# --- 2. Loop Through Different Window Lengths and Compute SK ---
+
+for (w_len in window_lengths) {
+  # Set overlap to half the window length (standard practice)
+  o_len <- 0.8 * w_len
+
+  # Compute Spectrogram: spec_output$S is the complex spectral estimate
+  spec_output <- specgram(
+    x,
+    n = 1024,
+    Fs = Fs,
+    overlap = o_len,
+    window = hanning(w_len)
+  )
+
+  # Calculate REAL-VALUED POWER (P = |S|^2)
+  P_matrix <- Mod(spec_output$S)^2
+
+  # Get frequency bins
+  freq_bins <- spec_output$f
+
+  # Data Cleaning (Exclude DC). Nyquist is already excluded by specgram function.
+  P_data <- P_matrix[-c(1), ]
+  freq_data <- freq_bins[-c(1)]
+
+  num_freq_bins <- nrow(P_data)
+  sk_values <- numeric(num_freq_bins)
+
+  # Compute Spectral Kurtosis for Each Single Frequency Bin
+  for (i in 1:num_freq_bins) {
+    energy_envelope <- P_data[i, ]
+    sk_values[i] <- e1071::kurtosis(energy_envelope, type = 1) + 1 # The +1 is to match spectral kurtosis definition in the literature.
+  }
+
+  # Store results in a data frame, including the window size as a factor
+  results_list[[as.character(w_len)]] <- data.frame(
+    Frequency_kHz = freq_data / 1000,
+    SK = sk_values,
+    Window_Size = as.factor(w_len)
+  )
+}
+
+# --- 3. Plotting the Results using ggplot2 ---
+
+# Combine all data frames into one long data frame
+plotting_df <- do.call(rbind, results_list)
+
+# Generate the ggplot object
+p <- ggplot(plotting_df, aes(x = Frequency_kHz, y = SK, color = Window_Size)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Replication of Figure 19(b) (SK vs. Frequency)",
+    x = "Frequency [kHz]",
+    y = "Spectral Kurtosis",
+    color = "Window Length (Nw)"
+  ) +
+  # Set limits similar to the original figure (0 to Nyquist, or 5 kHz)
+  scale_x_continuous(limits = c(0, Fs / 2000)) +
+  scale_y_continuous(limits = c(0, 70)) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+p
+
+# Save the plot
+ggsave("G_1_Channel_1_FirstRow.png", p, width = 10, height = 7)
+```
+
+Now, do the same thing above, but in a loop.
+
+```{r}
+# Get the last row index
+last_row_index <- g1_channel1_lazy |>
+  summarise(row_count = n()) |>
+  collect() |>
+  pull(row_count)
+
+# Generate 10 equally spaced row indices from first to last
+row_indices <- round(seq(1, last_row_index, length.out = 10))
+
+# Initialize list to store plots
+plot_list <- list()
+
+# Loop through each selected row index
+for (idx in seq_along(row_indices)) {
+  row_num <- row_indices[idx]
+
+  # Pull signal from the selected row
+  final_signal <- g1_channel1_lazy |>
+    dplyr::filter(row_number() == row_num) |>
+    collect()
+
+  # Extract signal vector
+  x <- final_signal[1, ] |> unlist() |> as.numeric()
+
+  # Set parameters
+  Fs <- 12800
+  window_lengths <- c(16, 32, 64, 128, 256)
+  results_list <- list()
+
+  # Compute spectral kurtosis for different window lengths
+  for (w_len in window_lengths) {
+    o_len <- 0.8 * w_len
+
+    spec_output <- specgram(
+      x,
+      n = 1024,
+      Fs = Fs,
+      overlap = o_len,
+      window = hanning(w_len)
+    )
+    P_matrix <- Mod(spec_output$S)^2
+    freq_bins <- spec_output$f
+
+    # Exclude DC bin
+    P_data <- P_matrix[-c(1), ]
+    freq_data <- freq_bins[-c(1)]
+
+    num_freq_bins <- nrow(P_data)
+    sk_values <- numeric(num_freq_bins)
+
+    for (i in 1:num_freq_bins) {
+      energy_envelope <- P_data[i, ]
+      sk_values[i] <- e1071::kurtosis(energy_envelope, type = 1) + 1
+    }
+
+    results_list[[as.character(w_len)]] <- data.frame(
+      Frequency_kHz = freq_data / 1000,
+      SK = sk_values,
+      Window_Size = as.factor(w_len)
+    )
+  }
+
+  # Combine results
+  plotting_df <- do.call(rbind, results_list)
+
+  # Create plot
+  p <- ggplot(
+    plotting_df,
+    aes(x = Frequency_kHz, y = SK, color = Window_Size)
+  ) +
+    geom_line(linewidth = 1) +
+    labs(
+      title = paste0("Spectral Kurtosis - Signal Row ", row_num),
+      x = "Frequency [kHz]",
+      y = "Spectral Kurtosis",
+      color = "Window Length (Nw)"
+    ) +
+    scale_x_continuous(limits = c(0, Fs / 2000)) +
+    scale_y_continuous(limits = c(0, 70)) +
+    theme_minimal() +
+    theme(legend.position = "right")
+
+  # Store plot in list
+  plot_list[[idx]] <- p
+
+  cat("Processed signal", idx, "of 10 (row", row_num, ")\n")
+}
+
+# Now you can view individual plots
+# plot_list[[1]]  # First signal
+# plot_list[[10]] # Last signal
+```
+
+
+Function to extract the time domain features
+
+```{r}
+
+calculate_vibration_timeDomainFeatures <- function(signal_vector) {
+  # --- Intermediate Calculations ---
+  abs_signal <- abs(signal_vector)
+
+  # Peak Value (Maximum Absolute Amplitude, xp)
+  peak_value <- max(abs_signal)
+
+  # RMS: Root Mean Square
+  rms_value <- sqrt(mean(signal_vector^2))
+
+  # Absolute Mean (Mean of the absolute values, or Rectified Mean)
+  abs_mean <- mean(abs_signal)
+
+  # Denominator for Margin Factor
+  # Formula: ( 1/N * sum(|x_i|) )^2
+  margin_denominator <- (abs_mean)^2
+
+  # --- Feature Calculations ---
+  results <- list(
+    # Basic Stats
+    Mean = mean(signal_vector),
+    Std_Dev = sd(signal_vector),
+    Peak_to_Peak = max(signal_vector) - min(signal_vector),
+    RMS = rms_value,
+
+    # Statistical Moments
+    Skewness = skewness(signal_vector),
+    Kurtosis = kurtosis(signal_vector),
+
+    # Factors (using the robust peak_value = max(|x|))
+    Crest_Factor = peak_value / rms_value,
+    Shape_Factor = rms_value / abs_mean,
+    Impulse_Factor = peak_value / abs_mean,
+
+    # Margin Factor (Denominator: Squared Mean of the Absolute Values)
+    Margin_Factor = peak_value / margin_denominator,
+
+    # Energy
+    Energy = sum(signal_vector^2) # Sum of Squares
+  )
+
+  return(results)
+}
+```

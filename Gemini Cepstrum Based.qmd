@@ -1,0 +1,1375 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+This document is used to plot power(dB) vs frequency, Power (RMS) vs frequency and spectral kurtosis vs frequency   graph for 5 different window sizes (32, 64, 128, 256, 512). I want 80% overlap. For a given channel, I will plot every 30th signal. This will give me an idea about the dominant frequencies present in the signal for different window sizes. Once you have this plot, take a decision on the window size to be used for further analysis. Please give me the code. Like before, I want to visualize the different window sizes in the same plot for comparison. Also, like before, I want a plotly plot where each frame is a signal. I want a function that takes in a channel and outputs a plotly plot. Please give me the code. 
+
+```{r}
+
+# renv::install("signal")
+# renv::install("e1071")
+# renv::install("av")
+# renv::install("future")
+# renv::install("furrr")
+# renv::install("plotly")
+# renv::install("htmlwidgets")
+# renv::install("pracma")
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(sparklyr)
+library(signal)
+library(e1071)
+library(av)
+library(parallel)
+library(future)
+library(furrr)
+library(data.table)
+library(plotly)
+library(htmlwidgets)
+library(pracma)
+```
+
+
+FULL Code ::
+
+```{r}
+# ============================================================================
+# PREPROCESSING FUNCTIONS
+# ============================================================================
+
+preprocess_signal <- function(signal_vector, Fs = 12800) {
+  # Step 1: Detrending - Remove the mean
+  detrended_signal <- signal_vector - mean(signal_vector)
+
+  # Step 2: Low-pass filtering
+  nyquist_freq <- Fs / 2
+  cutoff_freq <- 1 * nyquist_freq
+  W <- cutoff_freq / nyquist_freq
+
+  # Design Butterworth filter (4th order)
+  butter_filter <- butter(n = 4, W = W, type = "low")
+
+  # Apply the filter
+  filtered_signal <- filtfilt(butter_filter, detrended_signal)
+
+  return(filtered_signal)
+}
+
+calculate_vibration_timeDomainFeatures <- function(signal_vector) {
+  abs_signal <- abs(signal_vector)
+  peak_value <- max(abs_signal)
+  rms_value <- sqrt(mean(signal_vector^2))
+  abs_mean <- mean(abs_signal)
+  margin_denominator <- (abs_mean)^2
+
+  results <- list(
+    Mean = mean(signal_vector),
+    Std_Dev = sd(signal_vector),
+    Peak_to_Peak = max(signal_vector) - min(signal_vector),
+    RMS = rms_value,
+    Skewness = skewness(signal_vector),
+    Kurtosis = kurtosis(signal_vector),
+    Crest_Factor = peak_value / rms_value,
+    Shape_Factor = rms_value / abs_mean,
+    Impulse_Factor = peak_value / abs_mean,
+    Margin_Factor = peak_value / margin_denominator,
+    Energy = sum(signal_vector^2)
+  )
+
+  return(results)
+}
+
+# ============================================================================
+# STAGE 1: FAST SPECTRAL FINGERPRINTING (GMF-BASED) - MEMORY OPTIMIZED
+# ============================================================================
+
+extract_spectral_fingerprint <- function(
+  signal,
+  Fs = 12800,
+  preprocess = TRUE,
+  freq_min = 10,
+  freq_max = 6400,
+  gearbox_group = "G_1_to_G_3"
+) {
+  if (preprocess) {
+    signal <- preprocess_signal(signal)
+  }
+
+  # Compute FFT
+  n <- length(signal)
+  fft_result <- fft(signal)
+  magnitude <- Mod(fft_result[1:(n / 2)])
+  freqs <- (0:(n / 2 - 1)) * Fs / n
+
+  # Use full frequency range (exclude only DC and very low freq)
+  freq_mask <- freqs >= freq_min & freqs <= freq_max
+  magnitude_filtered <- magnitude[freq_mask]
+  freqs_filtered <- freqs[freq_mask]
+
+  # Define gear mesh frequencies
+  GMF1 <- 1160 # Test gearbox: Input-Intermediate mesh
+  GMF2 <- 439.6 # Test gearbox: Intermediate-Output mesh (PINION - FAILURE LOCATION)
+
+  # Extract energy at GMF harmonics
+  extract_gmf_harmonics <- function(gmf, n_harmonics = 5, bandwidth = 50) {
+    harmonic_energies <- numeric(n_harmonics)
+    for (h in 1:n_harmonics) {
+      freq_center <- gmf * h
+      freq_range <- (freqs_filtered >= (freq_center - bandwidth)) &
+        (freqs_filtered <= (freq_center + bandwidth))
+      if (sum(freq_range) > 0) {
+        harmonic_energies[h] <- sum(magnitude_filtered[freq_range]^2)
+      } else {
+        harmonic_energies[h] <- 0
+      }
+    }
+    return(harmonic_energies)
+  }
+
+  # Extract GMF harmonics
+  gmf1_harmonics <- extract_gmf_harmonics(GMF1, n_harmonics = 3)
+  gmf2_harmonics <- extract_gmf_harmonics(GMF2, n_harmonics = 5)
+
+  # Standard spectral features
+  total_energy <- sum(magnitude_filtered^2)
+
+  spectral_centroid <- sum(freqs_filtered * magnitude_filtered) /
+    sum(magnitude_filtered)
+
+  spectral_spread <- sqrt(
+    sum(((freqs_filtered - spectral_centroid)^2) * magnitude_filtered) /
+      sum(magnitude_filtered)
+  )
+
+  cumsum_energy <- cumsum(magnitude_filtered^2)
+  rolloff_idx <- which(cumsum_energy >= 0.85 * total_energy)[1]
+  spectral_rolloff <- freqs_filtered[rolloff_idx]
+
+  rms <- sqrt(mean(signal^2))
+
+  # High frequency energy ratio
+  high_freq_mask <- freqs_filtered >= 3000
+  high_freq_energy_ratio <- sum(magnitude_filtered[high_freq_mask]^2) /
+    total_energy
+
+  return(c(
+    Spectral_Centroid = spectral_centroid,
+    Spectral_Spread = spectral_spread,
+    Spectral_Rolloff = spectral_rolloff,
+    RMS = rms,
+    High_Freq_Energy_Ratio = high_freq_energy_ratio,
+    GMF2_H1 = gmf2_harmonics[1],
+    GMF2_H2 = gmf2_harmonics[2],
+    GMF2_H3 = gmf2_harmonics[3],
+    GMF2_H4 = gmf2_harmonics[4],
+    GMF2_H5 = gmf2_harmonics[5],
+    GMF1_H1 = gmf1_harmonics[1],
+    GMF1_H2 = gmf1_harmonics[2],
+    GMF1_H3 = gmf1_harmonics[3]
+  ))
+}
+
+precompute_spectral_fingerprints <- function(
+  gearbox_path,
+  channels = c(4, 5, 9),
+  gearbox_name = "Gearbox",
+  gearbox_group = NULL
+) {
+  cat("=== Computing spectral fingerprints for", gearbox_name, "===\n")
+
+  # Auto-detect gearbox group
+  if (is.null(gearbox_group)) {
+    if (grepl("G_[123]", gearbox_path)) {
+      gearbox_group <- "G_1_to_G_3"
+    } else if (grepl("G_[456]", gearbox_path)) {
+      gearbox_group <- "G_4_to_G_6"
+    } else {
+      warning("Could not detect gearbox group, defaulting to G_1_to_G_3")
+      gearbox_group <- "G_1_to_G_3"
+    }
+  }
+
+  cat("Detected gearbox group:", gearbox_group, "\n")
+
+  # Get number of signals by reading only the first channel's row count
+  channel_1_path <- file.path(
+    gearbox_path,
+    paste0("channel_", channels[1], ".csv")
+  )
+  n_signals <- nrow(fread(channel_1_path, select = 1L, header = TRUE)) # Only read first column to count rows
+
+  cat("Total signals:", n_signals, "\n")
+
+  # Initialize matrix
+  fingerprints_matrix <- matrix(nrow = n_signals, ncol = 13)
+  colnames(fingerprints_matrix) <- c(
+    "Spectral_Centroid",
+    "Spectral_Spread",
+    "Spectral_Rolloff",
+    "RMS",
+    "High_Freq_Energy_Ratio",
+    "GMF2_H1",
+    "GMF2_H2",
+    "GMF2_H3",
+    "GMF2_H4",
+    "GMF2_H5",
+    "GMF1_H1",
+    "GMF1_H2",
+    "GMF1_H3"
+  )
+
+  # Process each signal
+  for (signal_idx in 1:n_signals) {
+    # Average fingerprint across selected channels
+    channel_fingerprints <- matrix(nrow = length(channels), ncol = 13)
+
+    for (i in seq_along(channels)) {
+      ch <- channels[i]
+      channel_path <- file.path(gearbox_path, paste0("channel_", ch, ".csv"))
+
+      # Read ONLY this one signal (one row) - MEMORY OPTIMIZED!
+      signal <- fread(
+        channel_path,
+        skip = signal_idx - 1, # Skip to the specific row
+        nrows = 1, # Read only 1 row
+        header = TRUE
+      ) |>
+        unlist() |>
+        as.numeric()
+
+      channel_fingerprints[i, ] <- extract_spectral_fingerprint(
+        signal,
+        gearbox_group = gearbox_group
+      )
+    }
+
+    # Average across channels
+    fingerprints_matrix[signal_idx, ] <- colMeans(
+      channel_fingerprints,
+      na.rm = TRUE
+    )
+
+    # Progress every 10 signals
+    if (signal_idx %% 10 == 0) {
+      cat("  Processed", signal_idx, "of", n_signals, "\n")
+    }
+  }
+
+  rownames(fingerprints_matrix) <- paste0("Signal_", 1:n_signals)
+  cat("Fingerprint extraction complete!\n\n")
+
+  return(fingerprints_matrix)
+}
+
+compute_fingerprint_similarity <- function(
+  test_fingerprints,
+  train_fingerprints
+) {
+  # Normalize both
+  test_norm <- scale(test_fingerprints)
+  train_norm <- scale(train_fingerprints)
+
+  # Flatten and compute cosine similarity
+  test_vec <- as.vector(t(test_norm))
+  train_vec <- as.vector(t(train_norm))
+
+  # Remove NAs
+  valid_idx <- !is.na(test_vec) & !is.na(train_vec)
+
+  cosine_sim <- sum(test_vec[valid_idx] * train_vec[valid_idx]) /
+    (sqrt(sum(test_vec[valid_idx]^2)) * sqrt(sum(train_vec[valid_idx]^2)))
+
+  return(cosine_sim)
+}
+
+fast_candidate_selection_optimized <- function(
+  test_gearbox_path,
+  train_gearbox_path,
+  test_signal_indices = 1:5,
+  top_n_candidates = 50,
+  fingerprint_channels = c(4, 5, 9),
+  full_feature_channels = 1:11,
+  test_gearbox = NULL, # Add this
+  test_set = NULL, # Add this
+  train_gearbox = NULL # Add this
+) {
+  cat("=== Stage 1: Fast Spectral Fingerprint Screening ===\n")
+  cat(
+    "Using channels:",
+    paste(fingerprint_channels, collapse = ", "),
+    "(Output shaft vibrations + Acoustic emission)\n"
+  )
+  cat("Focusing on pinion failure signatures (GMF harmonics)\n\n")
+
+  # Create cache file names
+  test_cache_file <- paste0(
+    "fingerprints_",
+    test_gearbox,
+    "_",
+    test_set,
+    "_ch",
+    paste(fingerprint_channels, collapse = "_"),
+    ".rds"
+  )
+
+  train_cache_file <- paste0(
+    "fingerprints_",
+    train_gearbox,
+    "_ch",
+    paste(fingerprint_channels, collapse = "_"),
+    ".rds"
+  )
+
+  # Check if test fingerprints exist, otherwise compute
+  if (file.exists(test_cache_file)) {
+    cat("Loading cached test fingerprints from:", test_cache_file, "\n")
+    test_fingerprints_all <- readRDS(test_cache_file)
+  } else {
+    cat("Computing test fingerprints...\n")
+    test_fingerprints_all <- precompute_spectral_fingerprints(
+      test_gearbox_path,
+      channels = fingerprint_channels,
+      gearbox_name = basename(test_gearbox_path)
+    )
+    saveRDS(test_fingerprints_all, test_cache_file)
+    cat("Saved test fingerprints to:", test_cache_file, "\n")
+  }
+
+  # Check if train fingerprints exist, otherwise compute
+  if (file.exists(train_cache_file)) {
+    cat("Loading cached train fingerprints from:", train_cache_file, "\n")
+    train_fingerprints_all <- readRDS(train_cache_file)
+  } else {
+    cat("Computing train fingerprints...\n")
+    train_fingerprints_all <- precompute_spectral_fingerprints(
+      train_gearbox_path,
+      channels = fingerprint_channels,
+      gearbox_name = basename(train_gearbox_path)
+    )
+    saveRDS(train_fingerprints_all, train_cache_file)
+    cat("Saved train fingerprints to:", train_cache_file, "\n")
+  }
+
+  # Extract test trajectory
+  test_trajectory <- test_fingerprints_all[test_signal_indices, ]
+
+  n_train <- nrow(train_fingerprints_all)
+  window_size <- length(test_signal_indices)
+  n_windows <- n_train - window_size + 1
+
+  cat("Screening", n_windows, "windows...\n")
+
+  similarities <- numeric(n_windows)
+
+  for (i in 1:n_windows) {
+    train_window <- train_fingerprints_all[i:(i + window_size - 1), ]
+    similarities[i] <- compute_fingerprint_similarity(
+      test_trajectory,
+      train_window
+    )
+
+    if (i %% 200 == 0) {
+      cat("  Screened", i, "of", n_windows, "windows\n")
+    }
+  }
+
+  # Get top N candidates
+  top_indices <- order(similarities, decreasing = TRUE)[1:top_n_candidates]
+
+  candidates <- data.frame(
+    Window_Start = top_indices,
+    Window_End = top_indices + window_size - 1,
+    Fingerprint_Similarity = similarities[top_indices]
+  )
+
+  cat("\nTop", top_n_candidates, "candidates selected\n")
+  cat(
+    "Similarity range:",
+    round(min(candidates$Fingerprint_Similarity), 3),
+    "to",
+    round(max(candidates$Fingerprint_Similarity), 3),
+    "\n\n"
+  )
+
+  return(list(
+    candidates = candidates,
+    test_fingerprints = test_fingerprints_all,
+    train_fingerprints = train_fingerprints_all,
+    full_feature_channels = full_feature_channels
+  ))
+}
+
+# ============================================================================
+# STAGE 2: FULL FEATURE EXTRACTION - MEMORY OPTIMIZED
+# ============================================================================
+
+precompute_all_features <- function(
+  gearbox_path,
+  channels = 1:11,
+  preprocess = TRUE,
+  gearbox_name = "Gearbox"
+) {
+  cat("=== Pre-computing features for", gearbox_name, "===\n")
+
+  # Get number of signals by reading only first column
+  channel_1_path <- file.path(gearbox_path, "channel_1.csv")
+  n_signals <- nrow(fread(channel_1_path, select = 1L, header = TRUE)) # Only read first column to count rows
+
+  cat("Total signals:", n_signals, "\n")
+  cat("Channels:", length(channels), "\n")
+
+  all_features_matrix <- NULL
+  feature_names <- NULL
+
+  for (signal_idx in 1:n_signals) {
+    signal_features <- list()
+
+    for (ch in channels) {
+      channel_path <- file.path(gearbox_path, paste0("channel_", ch, ".csv"))
+
+      # Read ONLY this one signal (one row) - MEMORY OPTIMIZED!
+      signal <- fread(
+        channel_path,
+        skip = signal_idx - 1,
+        nrows = 1,
+        header = TRUE
+      ) |>
+        unlist() |>
+        as.numeric()
+
+      if (preprocess) {
+        signal <- preprocess_signal(signal)
+      }
+
+      # Time-domain features
+      td_features <- calculate_vibration_timeDomainFeatures(signal)
+
+      # Frequency-domain features (spectral kurtosis summary)
+      w_len <- 128
+      o_len <- 0.8 * w_len
+
+      spec_output <- specgram(
+        signal,
+        n = 512,
+        Fs = 12800,
+        overlap = o_len,
+        window = hanning(w_len)
+      )
+
+      P_matrix <- Mod(spec_output$S)^2
+      freq_bins <- spec_output$f
+
+      # Exclude DC bin
+      P_data <- P_matrix[-1, ]
+      freq_data <- freq_bins[-1]
+
+      # Calculate SK for frequency range >= 10 Hz (full range)
+      freq_mask <- freq_data >= 10
+
+      if (sum(freq_mask) > 0) {
+        P_data_filtered <- P_data[freq_mask, ]
+
+        num_freq_bins <- nrow(P_data_filtered)
+        sk_values <- numeric(num_freq_bins)
+
+        for (i in 1:num_freq_bins) {
+          energy_envelope <- P_data_filtered[i, ]
+          sk_values[i] <- e1071::kurtosis(energy_envelope, type = 1) + 1
+        }
+
+        sk_mean <- mean(sk_values, na.rm = TRUE)
+        sk_max <- max(sk_values, na.rm = TRUE)
+        sk_std <- sd(sk_values, na.rm = TRUE)
+      } else {
+        sk_mean <- NA
+        sk_max <- NA
+        sk_std <- NA
+      }
+
+      # Combine all features for this channel
+      channel_features <- c(
+        unlist(td_features),
+        SK_Mean = sk_mean,
+        SK_Max = sk_max,
+        SK_Std = sk_std
+      )
+
+      # Add channel prefix to feature names
+      names(channel_features) <- paste0("Ch", ch, ".", names(channel_features))
+      signal_features[[ch]] <- channel_features
+    }
+
+    # Flatten features for this signal
+    signal_feature_vector <- unlist(signal_features)
+
+    # Initialize matrix on first signal
+    if (is.null(all_features_matrix)) {
+      n_features <- length(signal_feature_vector)
+      all_features_matrix <- matrix(nrow = n_signals, ncol = n_features)
+      feature_names <- names(signal_feature_vector)
+      colnames(all_features_matrix) <- feature_names
+    }
+
+    all_features_matrix[signal_idx, ] <- signal_feature_vector
+
+    # Progress every 10 signals
+    if (signal_idx %% 10 == 0) {
+      cat("  Processed signal", signal_idx, "of", n_signals, "\n")
+    }
+  }
+
+  rownames(all_features_matrix) <- paste0("Signal_", 1:n_signals)
+
+  cat("Feature extraction complete!\n")
+  cat(
+    "Matrix dimensions:",
+    nrow(all_features_matrix),
+    "signals x",
+    ncol(all_features_matrix),
+    "features\n\n"
+  )
+
+  return(all_features_matrix)
+}
+
+extract_trajectory_from_precomputed <- function(
+  features_matrix,
+  signal_indices
+) {
+  return(features_matrix[signal_indices, , drop = FALSE])
+}
+
+compare_trajectories <- function(trajectory1, trajectory2) {
+  # Ensure same number of time points
+  if (nrow(trajectory1) != nrow(trajectory2)) {
+    stop("Trajectories must have the same number of time points")
+  }
+
+  if (ncol(trajectory1) != ncol(trajectory2)) {
+    stop("Trajectories must have the same features")
+  }
+
+  n_timepoints <- nrow(trajectory1)
+  n_features <- ncol(trajectory1)
+
+  # Method 1: Correlation of feature trends
+  correlations <- numeric(n_features)
+  for (i in 1:n_features) {
+    correlations[i] <- cor(
+      trajectory1[, i],
+      trajectory2[, i],
+      use = "complete.obs"
+    )
+  }
+  mean_correlation <- mean(correlations, na.rm = TRUE)
+
+  # Method 2: Euclidean distance between normalized trajectories
+  traj1_norm <- scale(trajectory1)
+  traj2_norm <- scale(trajectory2)
+  euclidean_dist <- sqrt(sum((traj1_norm - traj2_norm)^2, na.rm = TRUE))
+
+  # Method 3: Cosine similarity of flattened trajectories
+  vec1 <- as.vector(t(traj1_norm))
+  vec2 <- as.vector(t(traj2_norm))
+  valid_idx <- !is.na(vec1) & !is.na(vec2)
+  cosine_sim <- sum(vec1[valid_idx] * vec2[valid_idx]) /
+    (sqrt(sum(vec1[valid_idx]^2)) * sqrt(sum(vec2[valid_idx]^2)))
+
+  return(list(
+    mean_correlation = mean_correlation,
+    euclidean_distance = euclidean_dist,
+    cosine_similarity = cosine_sim
+  ))
+}
+
+refine_candidates_with_full_features <- function(
+  test_gearbox_path,
+  train_gearbox_path,
+  candidates,
+  test_signal_indices = 1:5,
+  test_features = NULL,
+  train_features = NULL,
+  channels = 1:11,
+  preprocess = TRUE
+) {
+  cat("=== Stage 2: Full Feature Comparison on Top Candidates ===\n")
+
+  # Pre-compute test features if not provided (only 5 signals)
+  if (is.null(test_features)) {
+    test_features <- precompute_all_features(
+      test_gearbox_path,
+      channels,
+      preprocess,
+      "Test"
+    )
+  }
+
+  # For train features: extract only for candidate windows
+  # Identify unique signal indices needed
+  unique_train_signals <- unique(unlist(lapply(1:nrow(candidates), function(i) {
+    candidates$Window_Start[i]:candidates$Window_End[i]
+  })))
+  unique_train_signals <- sort(unique_train_signals)
+
+  cat(
+    "Need features for",
+    length(unique_train_signals),
+    "unique train signals (from 50 windows)\n"
+  )
+
+  if (is.null(train_features)) {
+    # Compute features ONLY for needed signals
+    train_features_map <- list()
+
+    for (sig_idx in unique_train_signals) {
+      signal_features <- list()
+
+      for (ch in channels) {
+        channel_path <- file.path(
+          train_gearbox_path,
+          paste0("channel_", ch, ".csv")
+        )
+
+        signal <- fread(
+          channel_path,
+          skip = sig_idx - 1,
+          nrows = 1,
+          header = TRUE
+        ) |>
+          unlist() |>
+          as.numeric()
+
+        if (preprocess) {
+          signal <- preprocess_signal(signal)
+        }
+
+        # Time-domain features
+        td_features <- calculate_vibration_timeDomainFeatures(signal)
+
+        # Frequency-domain features
+        w_len <- 128
+        o_len <- 0.8 * w_len
+
+        spec_output <- specgram(
+          signal,
+          n = 512,
+          Fs = 12800,
+          overlap = o_len,
+          window = hanning(w_len)
+        )
+
+        P_matrix <- Mod(spec_output$S)^2
+        freq_bins <- spec_output$f
+        P_data <- P_matrix[-1, ]
+        freq_data <- freq_bins[-1]
+
+        freq_mask <- freq_data >= 10
+
+        if (sum(freq_mask) > 0) {
+          P_data_filtered <- P_data[freq_mask, ]
+          num_freq_bins <- nrow(P_data_filtered)
+          sk_values <- numeric(num_freq_bins)
+
+          for (i in 1:num_freq_bins) {
+            energy_envelope <- P_data_filtered[i, ]
+            sk_values[i] <- e1071::kurtosis(energy_envelope, type = 1) + 1
+          }
+
+          sk_mean <- mean(sk_values, na.rm = TRUE)
+          sk_max <- max(sk_values, na.rm = TRUE)
+          sk_std <- sd(sk_values, na.rm = TRUE)
+        } else {
+          sk_mean <- NA
+          sk_max <- NA
+          sk_std <- NA
+        }
+
+        channel_features <- c(
+          unlist(td_features),
+          SK_Mean = sk_mean,
+          SK_Max = sk_max,
+          SK_Std = sk_std
+        )
+
+        names(channel_features) <- paste0(
+          "Ch",
+          ch,
+          ".",
+          names(channel_features)
+        )
+        signal_features[[ch]] <- channel_features
+      }
+
+      train_features_map[[as.character(sig_idx)]] <- unlist(signal_features)
+
+      if (which(unique_train_signals == sig_idx) %% 10 == 0) {
+        cat(
+          "  Extracted features for",
+          which(unique_train_signals == sig_idx),
+          "of",
+          length(unique_train_signals),
+          "signals\n"
+        )
+      }
+    }
+  }
+
+  # Extract test trajectory
+  test_trajectory <- extract_trajectory_from_precomputed(
+    test_features,
+    test_signal_indices
+  )
+
+  # Compare with candidates
+  refined_results <- data.frame(
+    Window_Start = integer(),
+    Window_End = integer(),
+    Fingerprint_Similarity = numeric(),
+    Mean_Correlation = numeric(),
+    Euclidean_Distance = numeric(),
+    Cosine_Similarity = numeric()
+  )
+
+  for (i in 1:nrow(candidates)) {
+    start_idx <- candidates$Window_Start[i]
+    end_idx <- candidates$Window_End[i]
+    window_indices <- start_idx:end_idx
+
+    # Build train window from extracted features
+    train_window <- matrix(
+      nrow = length(window_indices),
+      ncol = length(train_features_map[[1]])
+    )
+    for (j in seq_along(window_indices)) {
+      train_window[j, ] <- train_features_map[[as.character(window_indices[j])]]
+    }
+    colnames(train_window) <- names(train_features_map[[1]])
+
+    similarity <- compare_trajectories(test_trajectory, train_window)
+
+    refined_results <- rbind(
+      refined_results,
+      data.frame(
+        Window_Start = start_idx,
+        Window_End = end_idx,
+        Fingerprint_Similarity = candidates$Fingerprint_Similarity[i],
+        Mean_Correlation = similarity$mean_correlation,
+        Euclidean_Distance = similarity$euclidean_distance,
+        Cosine_Similarity = similarity$cosine_similarity
+      )
+    )
+
+    if (i %% 10 == 0) {
+      cat("  Refined", i, "of", nrow(candidates), "candidates\n")
+    }
+  }
+
+  # Compute composite score
+  refined_results$Euclidean_Distance_Norm <- 1 -
+    (refined_results$Euclidean_Distance -
+      min(refined_results$Euclidean_Distance)) /
+      (max(refined_results$Euclidean_Distance) -
+        min(refined_results$Euclidean_Distance))
+
+  refined_results$Composite_Score <- (refined_results$Mean_Correlation +
+    refined_results$Cosine_Similarity +
+    refined_results$Euclidean_Distance_Norm) /
+    3
+
+  refined_results <- refined_results |> arrange(desc(Composite_Score))
+
+  cat("\n=== Refinement Complete ===\n")
+
+  return(refined_results)
+}
+
+# ============================================================================
+# COMPLETE PIPELINE
+# ============================================================================
+
+find_degradation_stage_fast_optimized <- function(
+  test_gearbox = "G_6",
+  test_set = "test_1",
+  test_signal_indices = 1:5,
+  train_gearbox = "G_1",
+  base_path = "C:/Users/shish/Documents/rul_challenge_data",
+  fingerprint_channels = c(4, 5, 9), # Output shaft + acoustic for Stage 1
+  full_feature_channels = 1:11, # All channels for Stage 2
+  top_n_candidates = 50,
+  preprocess = TRUE,
+  test_features = NULL,
+  train_features = NULL
+) {
+  test_path <- file.path(base_path, "test", test_gearbox, test_set)
+  train_path <- file.path(base_path, "train", train_gearbox)
+
+  # Stage 1: Fast screening with GMF-based fingerprints
+  stage1_output <- fast_candidate_selection_optimized(
+    test_path,
+    train_path,
+    test_signal_indices,
+    top_n_candidates,
+    fingerprint_channels,
+    full_feature_channels,
+    test_gearbox = test_gearbox, # Pass the value
+    test_set = test_set, # Pass the value
+    train_gearbox = train_gearbox # Pass the value
+  )
+
+  # Stage 2: Refined comparison with all channels
+  final_results <- refine_candidates_with_full_features(
+    test_path,
+    train_path,
+    stage1_output$candidates,
+    test_signal_indices,
+    test_features = test_features,
+    train_features = train_features,
+    channels = full_feature_channels,
+    preprocess = preprocess
+  )
+
+  return(list(
+    results = final_results,
+    stage1_output = stage1_output
+  ))
+}
+
+plot_degradation_matching <- function(results, train_gearbox = "G_1") {
+  # Find best matches
+  best_correlation <- results[which.max(results$Mean_Correlation), ]
+  best_cosine <- results[which.max(results$Cosine_Similarity), ]
+  best_euclidean <- results[which.min(results$Euclidean_Distance), ]
+  best_composite <- results[which.max(results$Composite_Score), ]
+
+  # Create interactive plot
+  fig <- plot_ly(results, x = ~Window_Start) |>
+    add_trace(
+      y = ~Mean_Correlation,
+      name = "Mean Correlation",
+      type = 'scatter',
+      mode = 'lines+markers',
+      line = list(width = 2)
+    ) |>
+    add_trace(
+      y = ~Cosine_Similarity,
+      name = "Cosine Similarity",
+      type = 'scatter',
+      mode = 'lines+markers',
+      line = list(width = 2)
+    ) |>
+    add_trace(
+      y = ~Euclidean_Distance_Norm,
+      name = "Euclidean (Normalized)",
+      type = 'scatter',
+      mode = 'lines+markers',
+      line = list(width = 2)
+    ) |>
+    add_trace(
+      y = ~Composite_Score,
+      name = "Composite Score",
+      type = 'scatter',
+      mode = 'lines+markers',
+      line = list(width = 2, dash = 'dash')
+    ) |>
+    layout(
+      title = paste("G_6 Degradation Stage Matching with", train_gearbox),
+      xaxis = list(title = paste(train_gearbox, "Signal Window Start Index")),
+      yaxis = list(title = "Similarity Score", range = c(0, 1)),
+      hovermode = "x unified"
+    )
+
+  # Print summary
+  cat("\n=== Best Matches ===\n")
+  cat(
+    "By Mean Correlation:",
+    best_correlation$Window_Start,
+    "-",
+    best_correlation$Window_End,
+    "(score:",
+    round(best_correlation$Mean_Correlation, 3),
+    ")\n"
+  )
+  cat(
+    "By Cosine Similarity:",
+    best_cosine$Window_Start,
+    "-",
+    best_cosine$Window_End,
+    "(score:",
+    round(best_cosine$Cosine_Similarity, 3),
+    ")\n"
+  )
+  cat(
+    "By Euclidean Distance:",
+    best_euclidean$Window_Start,
+    "-",
+    best_euclidean$Window_End,
+    "(score:",
+    round(best_euclidean$Euclidean_Distance, 2),
+    ")\n"
+  )
+  cat(
+    "By Composite Score:",
+    best_composite$Window_Start,
+    "-",
+    best_composite$Window_End,
+    "(score:",
+    round(best_composite$Composite_Score, 3),
+    ")\n"
+  )
+
+  return(fig)
+}
+```
+
+
+Using Cepstrum code from Gemini
+
+```{r}
+library(data.table)
+library(dplyr)
+library(signal)
+library(e1071)
+library(pracma)
+library(plotly)
+
+# ============================================================================
+# HELPER 1: SHAFT SPEED FROM KEY PHASOR (Channel 7)
+# ============================================================================
+get_shaft_speed_from_keyphasor <- function(keyphasor_vec, Fs = 12800) {
+  # 1. Normalize and Threshold
+  # Key phasor is a pulse train. We find the rising edges.
+  thresh <- (max(keyphasor_vec) - min(keyphasor_vec)) * 0.5 + min(keyphasor_vec)
+
+  # 2. Find rising edges (0 -> 1 transitions)
+  pulse_binary <- as.integer(keyphasor_vec > thresh)
+  rising_edges <- which(diff(pulse_binary) == 1)
+
+  if (length(rising_edges) < 2) {
+    return(list(hz = NA, edges = c()))
+  }
+
+  # 3. Calculate average speed
+  avg_samples_diff <- mean(diff(rising_edges))
+  shaft_freq_hz <- Fs / avg_samples_diff
+
+  return(list(hz = shaft_freq_hz, edges = rising_edges))
+}
+
+# ============================================================================
+# HELPER 2: CEPSTRUM RAHMONIC AMPLITUDE (Stage 1 Feature)
+# ============================================================================
+compute_cepstrum_features <- function(signal_vec, Fs, input_shaft_hz) {
+  n <- length(signal_vec)
+
+  # 1. Gear Kinematics
+  # Input: 2400 RPM (40 Hz). Pinion is on Intermediate Shaft.
+  # Ratio: Input(29T) -> Intermediate(95T)
+  intermediate_shaft_hz <- input_shaft_hz * (29 / 95)
+
+  # 2. Real Cepstrum
+  spec <- Mod(fft(signal_vec))
+  log_spec <- log(spec + 1e-10)
+  cepstrum <- Re(fft(log_spec, inverse = TRUE) / n)
+
+  # 3. Define Quefrency axis (seconds) & Half Cepstrum
+  quefrency <- (0:(n / 2 - 1)) / Fs
+  cepstrum_half <- cepstrum[1:(n / 2)]
+
+  # 4. Target Quefrency: Period of the Intermediate Shaft (Fault Location)
+  target_quefrency <- 1 / intermediate_shaft_hz
+
+  # 5. Find Amplitude in search window (+/- 10 samples for jitter)
+  target_idx <- which.min(abs(quefrency - target_quefrency))
+
+  # Handle edge case if target_idx is too close to start
+  start_win <- max(1, target_idx - 10)
+  end_win <- min(length(cepstrum_half), target_idx + 10)
+
+  rahmonic_amp <- max(cepstrum_half[start_win:end_win])
+
+  return(rahmonic_amp)
+}
+
+# ============================================================================
+# HELPER 3: TSA RESIDUAL FM4 (Stage 2 Feature)
+# ============================================================================
+compute_tsa_fm4 <- function(signal_vec, keyphasor_edges, Fs) {
+  # We perform TSA synchronous to the Input Shaft (Key Phasor).
+  # The fault is on the Intermediate Shaft (Non-synchronous).
+  # Therefore, the fault will appear in the RESIDUAL signal.
+
+  num_revs <- length(keyphasor_edges) - 1
+  if (num_revs < 1) {
+    return(NA)
+  }
+
+  # Target points per revolution for resampling
+  target_points <- 2048
+  tsa_matrix <- matrix(0, nrow = num_revs, ncol = target_points)
+
+  # 1. Angular Resampling
+  for (i in 1:num_revs) {
+    start_idx <- keyphasor_edges[i]
+    end_idx <- keyphasor_edges[i + 1]
+
+    segment <- signal_vec[start_idx:end_idx]
+
+    # Linear interpolation to stretch/shrink to fixed length
+    tsa_matrix[i, ] <- approx(
+      x = seq_along(segment),
+      y = segment,
+      n = target_points
+    )$y
+  }
+
+  # 2. Compute TSA (Mean) and Residual (Difference)
+  tsa_mean <- colMeans(tsa_matrix, na.rm = TRUE)
+  residual_matrix <- sweep(tsa_matrix, 2, tsa_mean, "-")
+
+  # 3. FM4 (Kurtosis) of the Residual
+  # Flatten the matrix to treat it as one continuous residual signal
+  residual_signal <- as.vector(residual_matrix)
+  fm4 <- kurtosis(residual_signal)
+
+  return(fm4)
+}
+
+# ============================================================================
+# MAIN PROCESSING FUNCTION (Handles Row-wise Structure)
+# ============================================================================
+process_gearbox_data <- function(
+  folder_path,
+  vib_channels = c(4, 5),
+  keyphasor_channel = 7,
+  indices_to_process = NULL # If NULL, process all rows
+) {
+  cat(paste("Loading data from:", basename(folder_path), "\n"))
+
+  # 1. Load the Key Phasor File (Channel 7)
+  # We assume the file name format is "channel_7.csv"
+  kp_path <- file.path(
+    folder_path,
+    paste0("channel_", keyphasor_channel, ".csv")
+  )
+  if (!file.exists(kp_path)) {
+    stop("Key Phasor file not found: ", kp_path)
+  }
+
+  # Read entire file (faster than row-by-row)
+  # data.table::fread is very efficient for this size (~150MB)
+  dt_kp <- fread(kp_path, header = TRUE)
+
+  # Determine which rows to process
+  if (is.null(indices_to_process)) {
+    rows_to_run <- 1:nrow(dt_kp)
+  } else {
+    rows_to_run <- indices_to_process
+  }
+
+  # 2. Load Vibration Channels
+  vib_data_list <- list()
+  for (ch in vib_channels) {
+    vib_path <- file.path(folder_path, paste0("channel_", ch, ".csv"))
+    cat(paste("  Loading Channel", ch, "...\n"))
+    vib_data_list[[as.character(ch)]] <- fread(vib_path, header = TRUE)
+  }
+
+  # 3. Process Rows
+  cat("  Computing features...\n")
+  results_list <- list()
+
+  # We iterate through the requested row indices
+  # Note: i is the actual row index in the CSV
+  for (i in rows_to_run) {
+    # Extract row as numeric vector
+    # unlist ensures we get a vector, not a 1-row data.table
+    kp_vec <- as.numeric(dt_kp[i, ])
+
+    # Get Speed Info
+    kp_info <- get_shaft_speed_from_keyphasor(kp_vec)
+
+    if (is.na(kp_info$hz)) {
+      # Handle cases where engine might be off or sensor bad
+      next
+    }
+
+    # Initialize result row
+    row_res <- list(Row_Index = i, Input_RPM = kp_info$hz * 60)
+
+    # Compute features for each vibration channel
+    for (ch in vib_channels) {
+      # Extract vibration signal vector for this row
+      sig_vec <- as.numeric(vib_data_list[[as.character(ch)]][i, ])
+
+      # Stage 1: Cepstrum
+      cep_amp <- compute_cepstrum_features(sig_vec, Fs = 12800, kp_info$hz)
+      row_res[[paste0("Cepstrum_Ch", ch)]] <- cep_amp
+
+      # Stage 2: TSA FM4
+      fm4_val <- compute_tsa_fm4(sig_vec, kp_info$edges, Fs = 12800)
+      row_res[[paste0("FM4_Ch", ch)]] <- fm4_val
+    }
+
+    results_list[[length(results_list) + 1]] <- as.data.frame(row_res)
+
+    if (length(results_list) %% 100 == 0) {
+      cat(paste("    Processed", length(results_list), "signals\n"))
+    }
+  }
+
+  return(bind_rows(results_list))
+}
+
+# ============================================================================
+# IMPROVED MATCHING LOGIC (Multivariate: Cepstrum + FM4)
+# ============================================================================
+find_matching_sequence <- function(test_df, train_df, top_n = 25) {
+  window_size <- nrow(test_df)
+
+  # --- 1. Select Feature Columns ---
+  # We now use BOTH Cepstrum (Modulation) AND FM4 (Localized Faults)
+  # This gives a holistic view of degradation.
+  feature_cols <- grep("Cepstrum|FM4", names(test_df), value = TRUE)
+
+  # --- 2. Normalize (Scale) Features ---
+  # We must scale the Training data to have mean=0, sd=1.
+  # Then we scale the Test data using the Training metrics (to keep reference).
+
+  train_mat_raw <- as.matrix(train_df[, feature_cols])
+
+  # Calculate Train stats
+  train_means <- colMeans(train_mat_raw, na.rm = TRUE)
+  train_sds <- apply(train_mat_raw, 2, sd, na.rm = TRUE)
+
+  # Avoid division by zero for constant columns
+  train_sds[train_sds == 0] <- 1
+
+  # Scale Train
+  train_mat_scaled <- scale(
+    train_mat_raw,
+    center = train_means,
+    scale = train_sds
+  )
+
+  # Scale Test (using Train stats!)
+  test_mat_raw <- as.matrix(test_df[, feature_cols])
+  test_mat_scaled <- sweep(test_mat_raw, 2, train_means, "-")
+  test_mat_scaled <- sweep(test_mat_scaled, 2, train_sds, "/")
+
+  # --- 3. Run Sliding Window Matching (Correlation) ---
+  n_train <- nrow(train_df)
+  n_windows <- n_train - window_size + 1
+  cor_scores <- numeric(n_windows)
+
+  # Flatten Test matrix for vector comparison?
+  # Actually, for multivariate matching, we often calculate the correlation
+  # between the *vector of features* at each time step, or the correlation
+  # of the flattened window.
+  # Let's use the "Flattened Window" correlation: matching the exact shape
+  # of the evolution of ALL features simultaneously.
+
+  test_vec <- as.vector(test_mat_scaled)
+
+  for (i in 1:n_windows) {
+    # Extract window from scaled training data
+    window_mat <- train_mat_scaled[i:(i + window_size - 1), ]
+    train_vec <- as.vector(window_mat)
+
+    # Compute Pearson Correlation
+    # (Robust to amplitude scaling, sensitive to shape/pattern)
+    cor_scores[i] <- cor(test_vec, train_vec)
+  }
+
+  # --- 4. Extract Top N Matches ---
+  top_indices <- order(cor_scores, decreasing = TRUE)[
+    1:min(top_n, length(cor_scores))
+  ]
+
+  top_matches_df <- data.frame(
+    Rank = 1:length(top_indices),
+    Start_Index_G1 = train_df$Row_Index[top_indices],
+    Correlation = cor_scores[top_indices]
+  )
+
+  return(list(
+    best_match = top_matches_df[1, ],
+    top_matches = top_matches_df,
+    all_scores = cor_scores
+  ))
+}
+```
+
+
+```{r}
+# ============================================================================
+# MEMORY-SAFE ENSEMBLE EXECUTION
+# ============================================================================
+
+library(dplyr)
+library(data.table) # Ensure data.table is loaded for fread
+library(plotly)
+
+# 1. Configuration
+base_path <- "C:/Users/shish/Documents/rul_challenge_data"
+test_gearbox <- "G_6"
+test_set <- "test_1"
+
+# Channels: Radial (4,5) + Torque (8) + Keyphasor (7)
+vib_channels <- c(4, 5, 8)
+keyphasor_channel <- 7
+
+# Training Gearboxes to process
+train_gearboxes <- c("G_1", "G_2", "G_3", "G_4", "G_5")
+
+# -----------------------------------------------------------------------------
+# STEP 2: SEQUENTIAL FEATURE EXTRACTION (Process -> Save -> Clear Memory)
+# -----------------------------------------------------------------------------
+
+for (gb in train_gearboxes) {
+  feature_file <- paste0(gb, "_spur_config_features.rds")
+
+  if (file.exists(feature_file)) {
+    cat(paste("Skipping", gb, "- Features already exist on disk.\n"))
+  } else {
+    cat(paste("\n=== Processing", gb, "to extract features ===\n"))
+
+    # 1. Construct path
+    gb_folder <- file.path(base_path, "train", gb)
+
+    # 2. Run Processing (Loads ~2GB RAM peak for this gearbox only)
+    # NOTE: Ensure process_gearbox_data is defined in your environment
+    feats <- process_gearbox_data(
+      folder_path = gb_folder,
+      vib_channels = vib_channels,
+      keyphasor_channel = keyphasor_channel
+    )
+
+    # 3. Save to disk immediately
+    saveRDS(feats, feature_file)
+    cat(paste("Saved features to", feature_file, "\n"))
+
+    # 4. CRITICAL: Clear Memory
+    rm(feats) # Remove the dataframe
+    gc() # Force Garbage Collection to free RAM before next iteration
+    cat("Memory cleared.\n")
+  }
+}
+
+# -----------------------------------------------------------------------------
+# STEP 3: PROCESS TEST DATA (G_6)
+# -----------------------------------------------------------------------------
+cat("\n=== Processing Test Data (G_6) ===\n")
+test_folder <- file.path(base_path, "test", test_gearbox, test_set)
+
+# We don't cache test data usually as it's small (5 rows), but good practice to be consistent
+test_features <- process_gearbox_data(
+  folder_path = test_folder,
+  vib_channels = vib_channels,
+  keyphasor_channel = keyphasor_channel,
+  indices_to_process = 1:5
+)
+
+# -----------------------------------------------------------------------------
+# STEP 4: ENSEMBLE MATCHING (Loads only lightweight features)
+# -----------------------------------------------------------------------------
+ensemble_results <- data.frame()
+
+cat("\n=== STARTING ENSEMBLE MATCHING ===\n")
+
+for (gb in train_gearboxes) {
+  # Load ONLY the features (Tiny file, negligible memory)
+  feature_file <- paste0(gb, "_spur_config_features.rds")
+  train_df <- readRDS(feature_file)
+
+  # Run matching logic
+  # Using Top 25 to assess spread/correlation
+  match_res <- find_matching_sequence(test_features, train_df, top_n = 25)
+
+  # Calculate Correlation Score (Shape matching)
+  # We re-calculate correlation for the best match window found by Cosine Similarity
+  # or scan for best correlation directly.
+
+  # Let's find the index with the highest Correlation Score among the available windows
+  cols_to_use <- grep("Cepstrum", names(test_features), value = TRUE)
+  test_mat <- as.matrix(test_features[, cols_to_use])
+  train_mat <- as.matrix(train_df[, cols_to_use])
+
+  n_windows <- nrow(train_df) - nrow(test_features) + 1
+  cor_scores <- numeric(n_windows)
+
+  # Fast correlation loop
+  for (i in 1:n_windows) {
+    window_mat <- train_mat[i:(i + nrow(test_features) - 1), ]
+    # Mean correlation across features
+    cors <- numeric(ncol(test_mat))
+    for (j in 1:ncol(test_mat)) {
+      cors[j] <- cor(test_mat[, j], window_mat[, j])
+    }
+    cor_scores[i] <- mean(cors, na.rm = TRUE)
+  }
+
+  best_idx <- which.max(cor_scores)
+  max_cor <- max(cor_scores, na.rm = TRUE)
+
+  # Calculate % Life
+  life_pct <- (best_idx / nrow(train_df)) * 100
+
+  # Store Result
+  ensemble_results <- rbind(
+    ensemble_results,
+    data.frame(
+      Train_Gearbox = gb,
+      Load_Condition = ifelse(
+        gb %in% c("G_1", "G_2", "G_3"),
+        "Low (17.9Nm)",
+        "High (26.5Nm)"
+      ),
+      Best_Start_Index = best_idx,
+      Total_Life_Cycles = nrow(train_df),
+      Life_Percentage = life_pct,
+      Max_Correlation = max_cor
+    )
+  )
+
+  # Clean up loop variables
+  rm(train_df, train_mat, cor_scores)
+}
+
+# -----------------------------------------------------------------------------
+# STEP 5: ANALYZE & VISUALIZE
+# -----------------------------------------------------------------------------
+print(ensemble_results)
+
+# Weighted Average (Weight by Correlation Score)
+# Higher correlation = Better shape match = More trust in that result
+weighted_life <- sum(
+  ensemble_results$Life_Percentage * ensemble_results$Max_Correlation
+) /
+  sum(ensemble_results$Max_Correlation)
+
+cat(sprintf("\n=== ENSEMBLE PREDICTION ===\n"))
+cat(sprintf("Weighted Average Degradation: %.2f%%\n", weighted_life))
+
+# Visualization
+fig <- plot_ly(
+  ensemble_results,
+  x = ~Train_Gearbox,
+  y = ~Life_Percentage,
+  type = 'bar',
+  color = ~Load_Condition,
+  text = ~ paste0(round(Life_Percentage, 1), "%"),
+  textposition = 'auto',
+  marker = list(line = list(width = 1.5))
+) %>%
+  layout(
+    title = "Estimated Degradation Stage by Training Gearbox",
+    yaxis = list(title = "Estimated Life Percentage (%)", range = c(0, 100)),
+    xaxis = list(title = "Training Reference")
+  )
+
+fig
+```
