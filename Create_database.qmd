@@ -3,6 +3,8 @@ title: "RUL Challenge Create Database"
 format: html
 ---
 
+This file is for the sole purpose of creating a duckdb database of the RUL Challenge data. After loading, I tested whether I was able to connect from R. I was. Success. Nothing else is done here. Once loaded, the database can be queried from other R scripts.
+
 Load libraries into renv.
 
 ```{r}
@@ -16,6 +18,7 @@ library(tidyverse)
 library(DBI)
 library(duckdb)
 library(sparklyr)
+
 
 ```
 
@@ -308,7 +311,54 @@ first_10_rows_test <- g6_test5_channel11_lazy %>%
 ```
 
 
+See if there is a faster way to load each rows since there are too many columns.
+
+```{r}
+g1_channel1_lazy <- tbl(con, "G_1.channel_1")
+
+start_time <- Sys.time()
+g1_channel1_first_1_rows <- g1_channel1_lazy %>%
+  head(1) %>%
+  collect() %>%
+  unlist() %>%
+  as.numeric()
+
+w_len <- 256
+spec_gram <- specgram(
+  x = g1_channel1_first_1_rows,
+  n = 1024,
+  Fs = 12800,
+  overlap = 0.8 * w_len,
+  window = hanning(w_len)
+)
+
+end_time <- Sys.time()
+cat(
+  "Time taken to load 1 row with",
+  length(g1_channel1_first_1_rows),
+  "columns:",
+  round(difftime(end_time, start_time, units = "secs"), 2),
+  "seconds.\n"
+)
+
+g1_channel1_lazy_df <- g1_channel1_lazy %>%
+  collect()
+```
+
 But the evaluation is too slow. It took 14 minutes to load 2 tables. I need to load almost 60 tables.
+
+Try data.table
+
+```{r}
+# install.packages("data.table") # Run this once if you don't have the package
+library(data.table)
+
+# Use forward slashes for clarity
+file_path <- "C:/Users/shish/Documents/rul_challenge_data/train/G_1/channel_1.csv"
+
+# Load the data frame quickly
+data_fast <- fread(file_path)
+```
 
 Convert CSV to Parquet format for faster loading.
 
