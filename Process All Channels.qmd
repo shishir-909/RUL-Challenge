@@ -1,0 +1,914 @@
+---
+title: "Process all channels"
+format: html
+---
+
+
+```{r}
+
+# renv::install("signal")
+# renv::install("e1071")
+# renv::install("av")
+# renv::install("future")
+# renv::install("furrr")
+# renv::install("plotly")
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(sparklyr)
+library(signal)
+library(e1071)
+library(av)
+library(parallel)
+library(future)
+library(furrr)
+library(data.table)
+```
+
+
+Write a function that takes in a channel, calculates the following, and stores them in a data frame:
+
+1. Time domain features (mean, std, peak to peak, rms, skewness, kurtosis, crest factor, shape factor, impulse factor, margin factor, energy) for every row in the channel and stores it in a list. Each list element contains the time domain features for one signal (row).
+2. Calculate the spectral kurtosis for every row in the channel using window sizes 32 and stores them in a list. Each list element contains a data frame with frequency, spectral kurtosis values, window size for one signal (row).
+3. Create a new list where each element contains a dataframe with columns as window size, mean spectral kurtosis, std. dev spectral kurtosis, kurtosis-spectral kurtosis, skewness-spectral kurtosis, peak-to-peak spectral kurtosis and area under curve spectral kurtosis. This data frame is built based on the data in point 2 above. Note that only the frequencies between 500 Hz and 5500 Hz from the data frames in point 2 above must be used. Each list element is for one signal (row)
+
+
+```{r}
+
+preprocess_signal <- function(signal_vector, Fs = 12800) {
+  # Step 1: Detrending - Remove the mean
+  detrended_signal <- signal_vector - mean(signal_vector)
+
+  # Step 2: Low-pass filtering
+  # Calculate Nyquist frequency
+  nyquist_freq <- Fs / 2
+
+  # Set cutoff frequency at 90% of Nyquist
+  cutoff_freq <- 0.9 * nyquist_freq
+
+  # Normalize cutoff frequency (between 0 and 1, where 1 is Nyquist)
+  W <- cutoff_freq / nyquist_freq
+
+  # Design Butterworth filter (4th order)
+  butter_filter <- butter(n = 4, W = W, type = "low")
+
+  # Apply the filter
+  filtered_signal <- filtfilt(butter_filter, detrended_signal)
+
+  return(filtered_signal)
+}
+
+
+calculate_vibration_timeDomainFeatures <- function(signal_vector) {
+  # --- Intermediate Calculations ---
+  abs_signal <- abs(signal_vector)
+
+  # Peak Value (Maximum Absolute Amplitude, xp)
+  peak_value <- max(abs_signal)
+
+  # RMS: Root Mean Square
+  rms_value <- sqrt(mean(signal_vector^2))
+
+  # Absolute Mean (Mean of the absolute values, or Rectified Mean)
+  abs_mean <- mean(abs_signal)
+
+  # Denominator for Margin Factor
+  # Formula: ( 1/N * sum(|x_i|) )^2
+  margin_denominator <- (abs_mean)^2
+
+  # --- Feature Calculations ---
+  results <- list(
+    # Basic Stats
+    Mean = mean(signal_vector),
+    Std_Dev = sd(signal_vector),
+    Peak_to_Peak = max(signal_vector) - min(signal_vector),
+    RMS = rms_value,
+
+    # Statistical Moments
+    Skewness = skewness(signal_vector),
+    Kurtosis = kurtosis(signal_vector),
+
+    # Factors (using the robust peak_value = max(|x|))
+    Crest_Factor = peak_value / rms_value,
+    Shape_Factor = rms_value / abs_mean,
+    Impulse_Factor = peak_value / abs_mean,
+
+    # Margin Factor (Denominator: Squared Mean of the Absolute Values)
+    Margin_Factor = peak_value / margin_denominator,
+
+    # Energy
+    Energy = sum(signal_vector^2) # Sum of Squares
+  )
+
+  return(results)
+}
+
+
+process_channel_features <- function(channel_data, Fs = 12800) {
+  # Initialize output lists
+  time_domain_features_list <- list()
+  sk_summary_features_list <- list()
+
+  # Get number of signals (rows)
+  n_signals <- nrow(channel_data)
+
+  # Process each signal
+  for (row_idx in 1:n_signals) {
+    # --- 1. Extract and preprocess signal ---
+    signal_vector <- channel_data[row_idx, ] |> unlist() |> as.numeric()
+
+    # Preprocess: detrend and filter
+    signal_vector <- preprocess_signal(signal_vector, Fs = Fs)
+
+    # --- 2. Calculate Time Domain Features ---
+    time_features <- calculate_vibration_timeDomainFeatures(signal_vector)
+    time_domain_features_list[[row_idx]] <- as.data.frame(time_features)
+
+    # --- 3. Calculate Spectral Kurtosis (Window length 32 only) ---
+    w_len <- 32
+    o_len <- 0.8 * w_len
+
+    # Compute spectrogram
+    spec_output <- specgram(
+      signal_vector,
+      n = 1024,
+      Fs = Fs,
+      overlap = o_len,
+      window = hanning(w_len)
+    )
+
+    P_matrix <- Mod(spec_output$S)^2
+    freq_bins <- spec_output$f
+
+    # Exclude DC bin
+    P_data <- P_matrix[-1, ]
+    freq_data <- freq_bins[-1]
+
+    # Calculate SK for each frequency bin
+    num_freq_bins <- nrow(P_data)
+    sk_values <- numeric(num_freq_bins)
+
+    for (i in 1:num_freq_bins) {
+      energy_envelope <- P_data[i, ]
+      sk_values[i] <- e1071::kurtosis(energy_envelope, type = 1) + 1
+    }
+
+    # --- 4. Calculate SK Summary Features (500-5500 Hz) ---
+    # Filter for frequency range
+    freq_mask <- freq_data >= 500 & freq_data <= 5500
+    sk_vals <- sk_values[freq_mask]
+    freq_vals <- freq_data[freq_mask]
+
+    # Calculate area under curve using trapezoidal rule
+    average_heights <- (sk_vals[-length(sk_vals)] + sk_vals[-1]) / 2
+    widths <- diff(freq_vals)
+    area_under_curve <- sum(average_heights * widths)
+
+    # Calculate summary statistics
+    sk_summary_df <- data.frame(
+      Window_Size = w_len,
+      Mean_SK = mean(sk_vals, na.rm = TRUE),
+      StdDev_SK = sd(sk_vals, na.rm = TRUE),
+      Kurtosis_SK = e1071::kurtosis(sk_vals),
+      Skewness_SK = e1071::skewness(sk_vals),
+      PeakToPeak_SK = max(sk_vals, na.rm = TRUE) - min(sk_vals, na.rm = TRUE),
+      AUC_SK = area_under_curve
+    )
+
+    sk_summary_features_list[[row_idx]] <- sk_summary_df
+
+    # Progress indicator
+    if (row_idx %% 100 == 0) {
+      cat("Processed signal", row_idx, "of", n_signals, "\n")
+    }
+  }
+
+  # Return only the two lists
+  return(list(
+    time_domain_features = time_domain_features_list,
+    sk_summary_features = sk_summary_features_list
+  ))
+}
+```
+
+
+Parallel Version.
+
+```{r}
+# Define base paths
+train_base_path <- "C:/Users/shish/Documents/rul_challenge_data/train"
+test_base_path <- "C:/Users/shish/Documents/rul_challenge_data/test"
+
+# Define schemas and channels
+train_schemas <- c("G_1", "G_2", "G_3", "G_4", "G_5")
+test_schemas <- paste0("G_6_test_", 1:5)
+channels <- c(
+  "channel_7",
+  "channel_8",
+  "channel_9",
+  "channel_10"
+)
+
+# ===== CONFIGURE BATCH SIZE HERE =====
+batch_size <- 2 # Number of tables to load and process at once
+# =====================================
+
+# Modified function that doesn't need database connection
+process_loaded_channel <- function(channel_info) {
+  schema <- channel_info$schema
+  channel <- channel_info$channel
+  channel_data <- channel_info$data
+
+  # Create output directory
+  output_dir <- file.path(schema, channel)
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Process the channel
+  start_time <- Sys.time()
+  results <- process_channel_features(channel_data, Fs = 12800)
+  end_time <- Sys.time()
+
+  processing_time <- round(difftime(end_time, start_time, units = "mins"), 2)
+
+  # Save results
+  saveRDS(
+    results$time_domain_features,
+    file.path(output_dir, "time_domain_features.rds")
+  )
+
+  saveRDS(
+    results$sk_summary_features,
+    file.path(output_dir, "sk_summary_features.rds")
+  )
+
+  return(list(
+    schema = schema,
+    channel = channel,
+    status = "completed",
+    n_signals = nrow(channel_data),
+    processing_time = processing_time
+  ))
+}
+
+# Create list of all file paths
+all_files <- list()
+
+# Add training files
+for (schema in train_schemas) {
+  for (channel in channels) {
+    file_name <- paste0(channel, ".csv")
+    file_path <- file.path(train_base_path, schema, file_name)
+
+    all_files[[length(all_files) + 1]] <- list(
+      schema = schema,
+      channel = channel,
+      path = file_path
+    )
+  }
+}
+
+# Add test files (G_6_test_1 through G_6_test_5)
+for (test_num in 1:5) {
+  schema <- paste0("G_6_test_", test_num)
+  for (channel in channels) {
+    file_name <- paste0(channel, ".csv")
+    file_path <- file.path(
+      test_base_path,
+      "G_6",
+      paste0("test_", test_num),
+      file_name
+    )
+
+    all_files[[length(all_files) + 1]] <- list(
+      schema = schema,
+      channel = channel,
+      path = file_path
+    )
+  }
+}
+
+cat("Total files to process:", length(all_files), "\n")
+cat("Batch size:", batch_size, "\n\n")
+
+# Process in batches
+all_results <- list()
+n_batches <- ceiling(length(all_files) / batch_size)
+
+for (batch_num in 1:n_batches) {
+  # Calculate batch indices
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(all_files))
+
+  cat("=== Batch", batch_num, "of", n_batches, "===\n")
+  cat("Loading files", start_idx, "to", end_idx, "\n\n")
+
+  # Load data for this batch
+  batch_data <- list()
+
+  for (i in start_idx:end_idx) {
+    schema <- all_files[[i]]$schema
+    channel <- all_files[[i]]$channel
+    file_path <- all_files[[i]]$path
+
+    cat("Loading:", file_path, "\n")
+
+    # Check if file exists
+    if (!file.exists(file_path)) {
+      cat("  Skipped: File does not exist\n")
+      next
+    }
+
+    # Load CSV using fread
+    channel_data <- tryCatch(
+      {
+        fread(file_path, header = TRUE)
+      },
+      error = function(e) {
+        cat("  Skipped: Error reading file -", e$message, "\n")
+        return(NULL)
+      }
+    )
+
+    if (!is.null(channel_data) && nrow(channel_data) > 0) {
+      batch_data[[length(batch_data) + 1]] <- list(
+        schema = schema,
+        channel = channel,
+        data = channel_data
+      )
+      cat("  Loaded:", nrow(channel_data), "signals\n")
+    }
+  }
+
+  # Skip if no valid data in batch
+  if (length(batch_data) == 0) {
+    cat("No valid files in this batch. Moving to next batch.\n\n")
+    next
+  }
+
+  cat("\nProcessing", length(batch_data), "files in parallel...\n")
+
+  # Set up parallel processing
+  plan(multisession, workers = parallel::detectCores() - 1)
+
+  # Process this batch in parallel
+  batch_results <- future_map_dfr(
+    batch_data,
+    process_loaded_channel,
+    .options = furrr_options(seed = TRUE),
+    .progress = TRUE
+  )
+
+  # Reset to sequential
+  plan(sequential)
+
+  # Store results
+  all_results[[batch_num]] <- batch_results
+
+  # Clear batch data from memory
+  rm(batch_data)
+  gc()
+
+  cat("\nBatch", batch_num, "completed!\n")
+  cat("Memory cleared.\n\n")
+}
+
+# Combine all results
+final_results <- bind_rows(all_results)
+
+# Display summary
+cat("\n=== Final Processing Summary ===\n")
+print(final_results)
+
+completed <- sum(final_results$status == "completed")
+cat("\nTotal completed:", completed, "channels\n")
+cat(
+  "Total processing time:",
+  round(sum(final_results$processing_time, na.rm = TRUE), 2),
+  "minutes\n"
+)
+
+saveRDS(
+  final_results,
+  file = "final_results_Non_Vibration.rds"
+)
+```
+
+Function that takes in a channel, calculates spectral kurtosis for different window sizes, plots spectral kurtosis vs frequency of every signal for diferent window sizes, and then gives an interactive plotly slider.
+
+```{r}
+library(plotly)
+
+create_interactive_sk_viewer <- function(
+  channel_data,
+  channel_name = "Channel",
+  Fs = 12800,
+  window_lengths = c(16, 32, 64, 128, 256)
+) {
+  # 1. Define the indices to process
+  row_indices_to_process <- unique(c(
+    seq(from = 1, to = nrow(channel_data), by = 50),
+    nrow(channel_data)
+  ))
+
+  if (length(row_indices_to_process) == 0) {
+    stop("Input 'channel_data' is empty or has zero rows.")
+  }
+
+  n_signals_count <- length(row_indices_to_process)
+  cat(
+    "Processing",
+    n_signals_count,
+    "signals (rows:",
+    paste(row_indices_to_process, collapse = ", "),
+    ") for",
+    channel_name,
+    "\n"
+  )
+
+  all_data <- data.frame()
+
+  # 2. Iterate and process
+  for (idx in row_indices_to_process) {
+    signal_vector <- channel_data[idx, ] |> unlist() |> as.numeric()
+    signal_vector <- preprocess_signal(signal_vector, Fs = Fs)
+
+    for (w_len in window_lengths) {
+      o_len <- 0.8 * w_len
+
+      spec_output <- specgram(
+        signal_vector,
+        n = 1024,
+        Fs = Fs,
+        overlap = o_len,
+        window = hanning(w_len)
+      )
+
+      P_matrix <- Mod(spec_output$S)^2
+      freq_bins <- spec_output$f
+
+      P_data <- P_matrix[-1, ]
+      freq_data <- freq_bins[-1]
+
+      num_freq_bins <- nrow(P_data)
+      sk_values <- numeric(num_freq_bins)
+
+      for (i in 1:num_freq_bins) {
+        energy_envelope <- P_data[i, ]
+        sk_values[i] <- e1071::kurtosis(energy_envelope, type = 1) + 1
+      }
+
+      signal_data <- data.frame(
+        Signal = idx,
+        Frequency_kHz = freq_data / 1000,
+        SK = sk_values,
+        Window_Size = as.factor(w_len)
+      )
+
+      all_data <- rbind(all_data, signal_data)
+    }
+  }
+
+  if (nrow(all_data) == 0) {
+    warning("No data generated for plotting. Returning NULL.")
+    return(NULL)
+  }
+
+  # 3. CRITICAL: Convert Signal to a factor with levels defining the order.
+  # This makes Plotly treat 'Signal' as a discrete set of frames.
+  signal_levels <- as.character(unique(all_data$Signal))
+  all_data$Signal <- factor(all_data$Signal, levels = signal_levels)
+
+  # 4. Prepare Slider Steps - Using the factor levels
+  # We use the *indices* (1, 2, 3...) of the unique frames in the animation arguments
+  slider_steps <- lapply(seq_along(signal_levels), function(i) {
+    list(
+      # The label is the actual row number (e.g., "1", "51", "101")
+      label = signal_levels[i],
+      method = "animate",
+      args = list(
+        # CRITICAL FIX: Reference the factor level value as a character for the animation call
+        list(signal_levels[i]),
+        list(mode = "immediate")
+      )
+    )
+  })
+
+  # 5. Create interactive plot
+  fig <- plot_ly(
+    all_data,
+    x = ~Frequency_kHz,
+    y = ~SK,
+    color = ~Window_Size,
+    frame = ~Signal,
+    type = 'scatter',
+    mode = 'lines',
+    line = list(width = 2)
+  ) |>
+    layout(
+      title = paste("Spectral Kurtosis -", channel_name),
+      xaxis = list(title = "Frequency [kHz]", range = c(0, Fs / 2000)),
+      yaxis = list(title = "Spectral Kurtosis", range = c(0, 70))
+    )
+
+  return(fig)
+}
+```
+
+Usage of plotly
+
+```{r}
+channel_data <- fread(
+  "C:/Users/shish/Documents/rul_challenge_data/train/G_1/channel_2.csv",
+  header = TRUE
+)
+
+fig <- create_interactive_sk_viewer(channel_data, "G_1 Channel 2")
+fig # Display in viewer - drag slider to navigate signals
+```
+
+Function that takes in a channel, calculates spectral kurtosis for different window sizes, plots spectral kurtosis vs frequency of every signal for diferent window sizes, and then gives an html slideshow.
+
+```{r}
+create_spectral_kurtosis_slideshow <- function(
+  channel_data,
+  channel_name = "Channel",
+  Fs = 12800,
+  window_lengths = c(16, 32, 64, 128, 256),
+  output_dir = "sk_slideshow"
+) {
+  # Create output directory
+  dir.create(output_dir, showWarnings = FALSE)
+  img_dir <- file.path(output_dir, "images")
+  dir.create(img_dir, showWarnings = FALSE)
+
+  # Get number of signals
+  n_signals <- nrow(channel_data)
+
+  cat("Processing", n_signals, "signals for", channel_name, "\n")
+
+  # Generate plots for each signal
+  for (idx in 1:n_signals) {
+    # Extract and preprocess signal
+    signal_vector <- channel_data[idx, ] |> unlist() |> as.numeric()
+    signal_vector <- preprocess_signal(signal_vector, Fs = Fs)
+
+    # Initialize results list
+    results_list <- list()
+
+    # Compute spectral kurtosis for different window lengths
+    for (w_len in window_lengths) {
+      o_len <- 0.8 * w_len
+
+      spec_output <- specgram(
+        signal_vector,
+        n = 1024,
+        Fs = Fs,
+        overlap = o_len,
+        window = hanning(w_len)
+      )
+
+      P_matrix <- Mod(spec_output$S)^2
+      freq_bins <- spec_output$f
+
+      # Exclude DC bin
+      P_data <- P_matrix[-1, ]
+      freq_data <- freq_bins[-1]
+
+      num_freq_bins <- nrow(P_data)
+      sk_values <- numeric(num_freq_bins)
+
+      for (i in 1:num_freq_bins) {
+        energy_envelope <- P_data[i, ]
+        sk_values[i] <- e1071::kurtosis(energy_envelope, type = 1) + 1
+      }
+
+      results_list[[as.character(w_len)]] <- data.frame(
+        Frequency_kHz = freq_data / 1000,
+        SK = sk_values,
+        Window_Size = as.factor(w_len)
+      )
+    }
+
+    # Combine results
+    plotting_df <- do.call(rbind, results_list)
+
+    # Create plot
+    p <- ggplot(
+      plotting_df,
+      aes(x = Frequency_kHz, y = SK, color = Window_Size)
+    ) +
+      geom_line(linewidth = 1) +
+      labs(
+        title = paste0("Spectral Kurtosis - ", channel_name, " - Signal ", idx),
+        x = "Frequency [kHz]",
+        y = "Spectral Kurtosis",
+        color = "Window Length (Nw)"
+      ) +
+      scale_x_continuous(limits = c(0, Fs / 2000)) +
+      scale_y_continuous(limits = c(0, 70)) +
+      theme_minimal() +
+      theme(legend.position = "right")
+
+    # Save plot
+    img_file <- file.path(img_dir, sprintf("signal_%04d.png", idx))
+    ggsave(img_file, plot = p, width = 10, height = 7, dpi = 100)
+
+    if (idx %% 100 == 0) {
+      cat("Processed", idx, "of", n_signals, "signals\n")
+    }
+  }
+
+  # Create HTML slideshow
+  html_content <- sprintf(
+    '
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Spectral Kurtosis Slideshow - %s</title>
+  <style>
+    body { 
+      text-align: center; 
+      background: #f0f0f0;
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+    }
+    h1 {
+      color: #333;
+      margin-bottom: 10px;
+    }
+    img { 
+      max-width: 90%%; 
+      height: auto;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+      background: white;
+      padding: 10px;
+    }
+    .controls { 
+      margin: 20px;
+      padding: 15px;
+      background: white;
+      border-radius: 8px;
+      display: inline-block;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    button {
+      background: #4CAF50;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      margin: 0 5px;
+      cursor: pointer;
+      font-size: 16px;
+      border-radius: 4px;
+    }
+    button:hover {
+      background: #45a049;
+    }
+    #playBtn.playing {
+      background: #f44336;
+    }
+    #counter {
+      font-size: 18px;
+      font-weight: bold;
+      color: #333;
+      margin: 0 15px;
+    }
+    .speed-control {
+      margin-top: 10px;
+    }
+    .speed-control label {
+      margin-right: 10px;
+      color: #666;
+    }
+    input[type="range"] {
+      width: 200px;
+      vertical-align: middle;
+    }
+  </style>
+</head>
+<body>
+  <h1>Spectral Kurtosis Slideshow</h1>
+  <h2>%s</h2>
+  <div class="controls">
+    <button onclick="prevSignal()">◄ Previous</button>
+    <button onclick="togglePlay()" id="playBtn">Play ►</button>
+    <button onclick="nextSignal()">Next ►</button>
+    <span id="counter">1 / %d</span>
+    <div class="speed-control">
+      <label>Speed:</label>
+      <input type="range" id="speedSlider" min="100" max="2000" value="500" step="100">
+      <span id="speedValue">0.5s</span>
+    </div>
+  </div>
+  <div>
+    <img id="signalImg" src="images/signal_0001.png" alt="Signal plot">
+  </div>
+  <script>
+    let currentSignal = 1;
+    let totalSignals = %d;
+    let playing = false;
+    let interval;
+    let speed = 500; // milliseconds
+    
+    function showSignal(n) {
+      currentSignal = n;
+      if (currentSignal < 1) currentSignal = totalSignals;
+      if (currentSignal > totalSignals) currentSignal = 1;
+      document.getElementById("signalImg").src = 
+        "images/signal_" + String(currentSignal).padStart(4, "0") + ".png";
+      document.getElementById("counter").textContent = 
+        currentSignal + " / " + totalSignals;
+    }
+    
+    function nextSignal() { showSignal(currentSignal + 1); }
+    function prevSignal() { showSignal(currentSignal - 1); }
+    
+    function togglePlay() {
+      playing = !playing;
+      const btn = document.getElementById("playBtn");
+      if (playing) {
+        btn.textContent = "Pause ❚❚";
+        btn.classList.add("playing");
+        interval = setInterval(nextSignal, speed);
+      } else {
+        btn.textContent = "Play ►";
+        btn.classList.remove("playing");
+        clearInterval(interval);
+      }
+    }
+    
+    // Speed control
+    document.getElementById("speedSlider").addEventListener("input", function(e) {
+      speed = parseInt(e.target.value);
+      document.getElementById("speedValue").textContent = (speed / 1000).toFixed(1) + "s";
+      if (playing) {
+        clearInterval(interval);
+        interval = setInterval(nextSignal, speed);
+      }
+    });
+    
+    // Keyboard shortcuts
+    document.addEventListener("keydown", function(e) {
+      if (e.key === "ArrowLeft") prevSignal();
+      if (e.key === "ArrowRight") nextSignal();
+      if (e.key === " ") { e.preventDefault(); togglePlay(); }
+    });
+  </script>
+</body>
+</html>
+',
+    channel_name,
+    channel_name,
+    n_signals,
+    n_signals
+  )
+
+  # Write HTML file
+  html_file <- file.path(output_dir, "spectral_kurtosis_slideshow.html")
+  writeLines(html_content, html_file)
+
+  cat("\n=== Slideshow created successfully ===\n")
+  cat("Total signals processed:", n_signals, "\n")
+  cat("Open this file in a web browser:\n")
+  cat(normalizePath(html_file), "\n")
+
+  return(invisible(html_file))
+}
+```
+
+Example of the above function
+
+```{r}
+# Load a channel
+channel_data <- fread(
+  "C:/Users/shish/Documents/rul_challenge_data/train/G_1/channel_1.csv",
+  header = TRUE
+)
+
+# Create slideshow
+create_spectral_kurtosis_slideshow(
+  channel_data = channel_data,
+  channel_name = "G_1 Channel 1",
+  output_dir = "G_1_channel_1_slideshow"
+)
+```
+
+ROUGH
+
+Connect to DuckDB
+
+```{r}
+# Connect to the DuckDB database (or create it if it doesn't exist)
+con <- dbConnect(
+  duckdb::duckdb(),
+  "C:\\Users\\shish\\Documents\\rul_challenge_data\\DuckDB\\large_data_warehouse.duckdb"
+)
+```
+
+Loop through all channels (Sequential Version)
+
+```{r}
+# Define schemas and channels
+schemas <- c("G_1", "G_2", "G_3", "G_4", "G_5")
+channels <- c(
+  "channel_1",
+  "channel_2",
+  "channel_3",
+  "channel_4",
+  "channel_5",
+  "channel_6",
+  "channel_11"
+)
+
+# Process each schema
+for (schema in schemas) {
+  cat("\n=== Processing Schema:", schema, "===\n")
+
+  # Process each channel
+  for (channel in channels) {
+    table_name <- paste0(schema, ".", channel)
+
+    cat("\nAttempting to process:", table_name, "\n")
+
+    # Create output directory structure
+    output_dir <- file.path(schema, channel)
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+    # Try to connect to the channel lazily
+    channel_lazy <- tryCatch(
+      {
+        tbl(con, table_name)
+      },
+      error = function(e) {
+        cat(
+          "Table",
+          table_name,
+          "does not exist or cannot be accessed. Skipping.\n"
+        )
+        return(NULL)
+      }
+    )
+
+    # Skip if connection failed
+    if (is.null(channel_lazy)) {
+      next
+    }
+
+    # Collect data into memory
+    channel_data <- channel_lazy |> collect()
+
+    cat("Loaded", nrow(channel_data), "signals from", table_name, "\n")
+
+    # Process the channel
+    start_time <- Sys.time()
+    results <- process_channel_features(channel_data, Fs = 12800)
+    end_time <- Sys.time()
+
+    cat(
+      "Processing completed in",
+      round(difftime(end_time, start_time, units = "mins"), 2),
+      "minutes\n"
+    )
+
+    # Save results
+    saveRDS(
+      results$time_domain_features,
+      file.path(output_dir, "time_domain_features.rds")
+    )
+
+    saveRDS(
+      results$spectral_kurtosis,
+      file.path(output_dir, "spectral_kurtosis.rds")
+    )
+
+    saveRDS(
+      results$sk_summary_features,
+      file.path(output_dir, "sk_summary_features.rds")
+    )
+
+    cat("Results saved to:", output_dir, "\n")
+
+    # Clear channel data from memory
+    rm(channel_data, channel_lazy, results)
+    gc() # Force garbage collection
+
+    cat("Memory cleared for next channel\n")
+  }
+}
+
+cat("\n=== All channels processed successfully ===\n")
+```
+
+Try loading a few different channels to look at their dimensions.
+
+
+```{r}
+G_1_channel_10 <- fread(
+  "C:/Users/shish/Documents/rul_challenge_data/train/G_1/channel_10.csv",
+  header = TRUE
+)
+
+rm(G_1_channel_10)
+```
